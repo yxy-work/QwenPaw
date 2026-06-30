@@ -77,6 +77,10 @@ class _SdkLoggerAdapter:
 
 # Max number of processed message_ids to keep for dedup.
 _WECOM_PROCESSED_IDS_MAX = 2000
+_ARCHIVE_UPLOAD_ACK_PROMPT = (
+    "请直接回答：文件已上传成功，后台路径：{path}。"
+    "文件将被解压并进一步建立知识库"
+)
 
 # Media upload via WebSocket long-connection.
 _UPLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB of raw data per chunk
@@ -448,6 +452,7 @@ class WecomChannel(BaseChannel):
 
             content_parts: List[Any] = []
             text_parts: List[str] = []
+            archive_unpack_requests: List[str] = []
 
             if msgtype == "text":
                 text = (body.get("text") or {}).get("content", "").strip()
@@ -515,13 +520,20 @@ class WecomChannel(BaseChannel):
                         filename_hint=filename,
                     )
                     if path:
-                        content_parts.append(
-                            FileContent(
-                                type=ContentType.FILE,
-                                file_url=path,
-                                filename=filename,
-                            ),
-                        )
+                        is_archive_upload = self._is_supported_archive_upload(path)
+                        if is_archive_upload:
+                            text_parts.append(
+                                _ARCHIVE_UPLOAD_ACK_PROMPT.format(path=path),
+                            )
+                            archive_unpack_requests.append(path)
+                        else:
+                            content_parts.append(
+                                FileContent(
+                                    type=ContentType.FILE,
+                                    file_url=path,
+                                    filename=filename,
+                                ),
+                            )
                     else:
                         text_parts.append("[file: download failed]")
                 else:
@@ -589,13 +601,22 @@ class WecomChannel(BaseChannel):
                                 filename_hint=filename,
                             )
                             if path:
-                                content_parts.append(
-                                    FileContent(
-                                        type=ContentType.FILE,
-                                        file_url=path,
-                                        filename=filename,
-                                    ),
+                                is_archive_upload = self._is_supported_archive_upload(
+                                    path,
                                 )
+                                if is_archive_upload:
+                                    text_parts.append(
+                                        _ARCHIVE_UPLOAD_ACK_PROMPT.format(path=path),
+                                    )
+                                    archive_unpack_requests.append(path)
+                                else:
+                                    content_parts.append(
+                                        FileContent(
+                                            type=ContentType.FILE,
+                                            file_url=path,
+                                            filename=filename,
+                                        ),
+                                    )
                             else:
                                 text_parts.append("[file: download failed]")
                         else:
@@ -712,6 +733,12 @@ class WecomChannel(BaseChannel):
             )
             if self._enqueue is not None:
                 self._enqueue(native)
+            for archive_path in archive_unpack_requests:
+                self._schedule_archive_unpack_report(
+                    path=archive_path,
+                    frame=frame,
+                    chatid=chatid,
+                )
         except Exception:
             logger.exception("wecom _on_message failed")
 
@@ -738,6 +765,99 @@ class WecomChannel(BaseChannel):
     # ------------------------------------------------------------------
     # File download helper
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_supported_archive_upload(path: str) -> bool:
+        from ...uploads.archive_unpack import is_supported_archive_path
+
+        return is_supported_archive_path(path)
+
+    def _schedule_archive_unpack_report(
+        self,
+        path: str,
+        frame: Any,
+        chatid: str,
+    ) -> None:
+        task = asyncio.create_task(
+            self._unpack_archive_and_report(path, frame, chatid),
+        )
+        task.add_done_callback(self._log_archive_unpack_task_result)
+
+    @staticmethod
+    def _log_archive_unpack_task_result(task: "asyncio.Task[None]") -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.info("wecom archive unpack task cancelled")
+        except Exception:
+            logger.exception("wecom archive unpack task failed")
+
+    async def _unpack_archive_and_report(
+        self,
+        path: str,
+        frame: Any,
+        chatid: str,
+    ) -> None:
+        from ...uploads.archive_unpack import unpack_archive_file
+
+        try:
+            result = await asyncio.to_thread(unpack_archive_file, path)
+        except Exception as exc:
+            logger.exception("wecom archive unpack failed path=%s", path)
+            await self._send_background_text(
+                frame=frame,
+                chatid=chatid,
+                text=(
+                    "压缩文件后台解压失败。\n"
+                    f"源文件：{path}\n"
+                    f"错误：{exc}"
+                ),
+            )
+            return
+
+        conflict = result.get("conflict") or {}
+        output_root = result.get("output_root") or ""
+        lines = [
+            "压缩文件已解压完成。",
+            f"源文件：{path}",
+            f"解压目录：{output_root}",
+        ]
+        if conflict.get("renamed"):
+            lines.append(
+                "同名目录已存在，已自动改用："
+                f"{conflict.get('actual_output_root')}",
+            )
+        await self._send_background_text(
+            frame=frame,
+            chatid=chatid,
+            text="\n".join(lines),
+        )
+
+    async def _send_background_text(
+        self,
+        frame: Any,
+        chatid: str,
+        text: str,
+    ) -> None:
+        if not self._client or not text:
+            return
+        if frame:
+            await self._send_text_via_frame(frame, text)
+            return
+        if chatid:
+            try:
+                await self._client.send_message(
+                    chatid,
+                    {
+                        "msgtype": "markdown",
+                        "markdown": {"content": text},
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "wecom archive unpack background report failed chatid=%s",
+                    chatid,
+                )
 
     async def _download_media(
         self,
