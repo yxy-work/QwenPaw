@@ -16,11 +16,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -81,6 +84,11 @@ _ARCHIVE_UPLOAD_ACK_PROMPT = (
     "请直接回答：文件已上传成功，后台路径：{path}。"
     "文件将被解压并进一步建立知识库"
 )
+_DEFAULT_KB_CLI_PATH = Path("/home/yangxinyu/Test/anaconda3/envs/KB/bin/kb")
+_KB_INGEST_CUDA_VISIBLE_DEVICES = "2,3"
+_KB_INGEST_POLL_INTERVAL_SECONDS = 30.0
+_KB_INGEST_LOG_DIR_NAME = "kb_ingest_logs"
+_WECOM_MEDIA_PREFIX_RE = re.compile(r"^wecom_[a-z0-9]{8}_")
 
 # Media upload via WebSocket long-connection.
 _UPLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB of raw data per chunk
@@ -191,6 +199,26 @@ class WecomChannel(BaseChannel):
         else:
             self._media_dir = DEFAULT_MEDIA_DIR
         self._max_reconnect_attempts = max_reconnect_attempts
+        self._kb_cli_path = Path(
+            os.getenv("QWENPAW_KB_CLI_PATH", str(_DEFAULT_KB_CLI_PATH)),
+        ).expanduser()
+        self._kb_ingest_cuda_visible_devices = os.getenv(
+            "QWENPAW_KB_INGEST_CUDA_VISIBLE_DEVICES",
+            _KB_INGEST_CUDA_VISIBLE_DEVICES,
+        )
+        self._kb_ingest_poll_interval_seconds = float(
+            os.getenv(
+                "QWENPAW_KB_INGEST_POLL_INTERVAL_SECONDS",
+                str(_KB_INGEST_POLL_INTERVAL_SECONDS),
+            ),
+        )
+        self._kb_project_dir = Path(
+            os.getenv(
+                "QWENPAW_KB_PROJECT_DIR",
+                "/home/yangxinyu/Test/Projects/KnowledgeBase",
+            ),
+        ).expanduser()
+        self._kb_ingest_extra_env: Dict[str, str] = {}
 
         self._client: Any = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -821,6 +849,7 @@ class WecomChannel(BaseChannel):
             "压缩文件已解压完成。",
             f"源文件：{path}",
             f"解压目录：{output_root}",
+            "接下来将开始建立知识库。",
         ]
         if conflict.get("renamed"):
             lines.append(
@@ -832,6 +861,274 @@ class WecomChannel(BaseChannel):
             chatid=chatid,
             text="\n".join(lines),
         )
+        if output_root:
+            await self._ingest_unpacked_archive_and_report(
+                source_dir=Path(output_root),
+                frame=frame,
+                chatid=chatid,
+            )
+
+    def _resolve_kb_cli_path(self) -> Path:
+        configured_path = Path(self._kb_cli_path).expanduser()
+        if configured_path.exists():
+            return configured_path
+
+        kb_path = shutil.which("kb")
+        if kb_path:
+            return Path(kb_path)
+
+        raise FileNotFoundError(
+            "未找到 kb CLI。请设置 QWENPAW_KB_CLI_PATH，或确认 "
+            f"{configured_path} 存在。"
+        )
+
+    def _build_kb_ingest_log_path(self, kb_name: str) -> Path:
+        log_dir = self._media_dir / _KB_INGEST_LOG_DIR_NAME
+        log_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", kb_name).strip("_")
+        if not safe_name:
+            safe_name = "knowledgebase"
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        return log_dir / f"{timestamp}_{safe_name}.log"
+
+    def _build_kb_process_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = self._kb_ingest_cuda_visible_devices
+        env.update(self._kb_ingest_extra_env)
+        return env
+
+    @staticmethod
+    def _derive_kb_name_from_unpacked_dir(source_dir: Path) -> str:
+        kb_name = _WECOM_MEDIA_PREFIX_RE.sub("", source_dir.name, count=1)
+        return kb_name or source_dir.name
+
+    async def _ingest_unpacked_archive_and_report(
+        self,
+        source_dir: Path,
+        frame: Any,
+        chatid: str,
+    ) -> None:
+        source_dir = source_dir.expanduser().resolve()
+        kb_name = self._derive_kb_name_from_unpacked_dir(source_dir)
+        log_path = self._build_kb_ingest_log_path(kb_name)
+
+        try:
+            kb_cli_path = self._resolve_kb_cli_path()
+            process = await self._start_kb_ingest_process(
+                kb_cli_path=kb_cli_path,
+                source_dir=source_dir,
+                kb_name=kb_name,
+                log_path=log_path,
+            )
+        except Exception as exc:
+            logger.exception(
+                "wecom kb ingest start failed source_dir=%s",
+                source_dir,
+            )
+            await self._send_background_text(
+                frame=frame,
+                chatid=chatid,
+                text=(
+                    "知识库建库启动失败。\n"
+                    f"解压目录：{source_dir}\n"
+                    f"知识库名称：{kb_name}\n"
+                    f"错误：{exc}"
+                ),
+            )
+            return
+
+        await self._send_background_text(
+            frame=frame,
+            chatid=chatid,
+            text=(
+                "开始建立知识库。\n"
+                f"解压目录：{source_dir}\n"
+                f"知识库名称：{kb_name}\n"
+                f"后台进程 PID：{process.pid}\n"
+                f"日志：{log_path}"
+            ),
+        )
+
+        return_code = await self._wait_for_kb_ingest_process(
+            process=process,
+            pid=process.pid,
+            source_dir=source_dir,
+            kb_name=kb_name,
+        )
+        if return_code != 0:
+            await self._send_background_text(
+                frame=frame,
+                chatid=chatid,
+                text=(
+                    "知识库建库失败。\n"
+                    f"解压目录：{source_dir}\n"
+                    f"知识库名称：{kb_name}\n"
+                    f"后台进程 PID：{process.pid}\n"
+                    f"退出码：{return_code}\n"
+                    f"日志：{log_path}"
+                ),
+            )
+            return
+
+        await self._confirm_kb_ingest_result(
+            kb_name=kb_name,
+            source_dir=source_dir,
+            log_path=log_path,
+            frame=frame,
+            chatid=chatid,
+        )
+
+    async def _start_kb_ingest_process(
+        self,
+        kb_cli_path: Path,
+        source_dir: Path,
+        kb_name: str,
+        log_path: Path,
+    ) -> "asyncio.subprocess.Process":
+        command = [
+            str(kb_cli_path),
+            "ingest",
+            "--source",
+            str(source_dir),
+            "--kb-name",
+            kb_name,
+            "--apply",
+            "--parse-image",
+        ]
+        logger.info("wecom kb ingest command=%s", command)
+        with log_path.open("ab") as log_file:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self._build_kb_process_env(),
+                cwd=str(self._kb_project_dir),
+            )
+        logger.info(
+            "wecom kb ingest started pid=%s source_dir=%s kb_name=%s",
+            process.pid,
+            source_dir,
+            kb_name,
+        )
+        return process
+
+    async def _wait_for_kb_ingest_process(
+        self,
+        process: "asyncio.subprocess.Process",
+        pid: int,
+        source_dir: Path,
+        kb_name: str,
+    ) -> int:
+        while process.returncode is None:
+            try:
+                return await asyncio.wait_for(
+                    process.wait(),
+                    timeout=self._kb_ingest_poll_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "wecom kb ingest still running pid=%s source_dir=%s "
+                    "kb_name=%s",
+                    pid,
+                    source_dir,
+                    kb_name,
+                )
+        return process.returncode
+
+    async def _confirm_kb_ingest_result(
+        self,
+        kb_name: str,
+        source_dir: Path,
+        log_path: Path,
+        frame: Any,
+        chatid: str,
+    ) -> None:
+        try:
+            payload = await self._run_kb_list_json()
+            matched_kb = self._find_knowledgebase(payload, kb_name)
+        except Exception as exc:
+            logger.exception("wecom kb list failed kb_name=%s", kb_name)
+            await self._send_background_text(
+                frame=frame,
+                chatid=chatid,
+                text=(
+                    "知识库建库进程已完成，但清单确认失败。\n"
+                    f"解压目录：{source_dir}\n"
+                    f"知识库名称：{kb_name}\n"
+                    f"错误：{exc}\n"
+                    f"日志：{log_path}"
+                ),
+            )
+            return
+
+        if not matched_kb:
+            await self._send_background_text(
+                frame=frame,
+                chatid=chatid,
+                text=(
+                    "知识库建库进程已完成，但 kb list 未发现目标知识库。\n"
+                    f"解压目录：{source_dir}\n"
+                    f"知识库名称：{kb_name}\n"
+                    f"日志：{log_path}"
+                ),
+            )
+            return
+
+        source_count = matched_kb.get("source_count", "未知")
+        chunk_count = matched_kb.get("chunk_count", "未知")
+        kb_directory = matched_kb.get("kb_directory", "未知")
+        await self._send_background_text(
+            frame=frame,
+            chatid=chatid,
+            text=(
+                "知识库建库已完成并已出现在清单中。\n"
+                f"知识库名称：{kb_name}\n"
+                f"知识库目录：{kb_directory}\n"
+                f"文档数：{source_count}\n"
+                f"Chunk 数：{chunk_count}\n"
+                f"日志：{log_path}"
+            ),
+        )
+
+    async def _run_kb_list_json(self) -> dict[str, Any]:
+        kb_cli_path = self._resolve_kb_cli_path()
+        process = await asyncio.create_subprocess_exec(
+            str(kb_cli_path),
+            "list",
+            "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self._build_kb_process_env(),
+            cwd=str(self._kb_project_dir),
+        )
+        stdout, stderr = await process.communicate()
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        if process.returncode != 0:
+            raise RuntimeError(
+                "kb list --json 执行失败: "
+                f"returncode={process.returncode}\nstderr={stderr_text}"
+            )
+        try:
+            return json.loads(stdout_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "kb list --json 输出不是有效 JSON: "
+                f"{stdout_text[:1000]}"
+            ) from exc
+
+    @staticmethod
+    def _find_knowledgebase(
+        payload: dict[str, Any],
+        kb_name: str,
+    ) -> dict[str, Any] | None:
+        knowledgebases = payload.get("knowledgebases")
+        if not isinstance(knowledgebases, list):
+            return None
+        for item in knowledgebases:
+            if isinstance(item, dict) and item.get("kb_name") == kb_name:
+                return item
+        return None
 
     async def _send_background_text(
         self,
@@ -1696,6 +1993,7 @@ class WecomChannel(BaseChannel):
             bot_id=self.bot_id,
             secret=self.secret,
             max_reconnect_attempts=self._max_reconnect_attempts,
+            request_timeout=300000,
             logger=_SdkLoggerAdapter(_sdk_logger),
         )
         self._client = WSClient(options)
