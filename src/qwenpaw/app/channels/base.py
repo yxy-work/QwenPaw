@@ -960,6 +960,17 @@ class BaseChannel(ABC):
             )
             if process_iterator is not None:
                 await process_iterator.aclose()
+            try:
+                await self._on_task_cancelled(
+                    request,
+                    to_handle,
+                    send_meta,
+                )
+            except BaseException:
+                logger.debug(
+                    "_on_task_cancelled cleanup failed",
+                    exc_info=True,
+                )
             raise
 
         except Exception as e:
@@ -1459,6 +1470,19 @@ class BaseChannel(ABC):
         """
         Hook called once per consume_one before running _process. Override
         to e.g. save receive_id for send path (Feishu).
+        """
+
+    async def _on_task_cancelled(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """
+        Hook called when a streaming task is cancelled.
+
+        Subclasses can close channel-specific placeholder streams or cancel
+        background keepalive tasks before cancellation propagates.
         """
 
     async def on_event_content(

@@ -34,6 +34,7 @@ from qwenpaw.schemas import (
     AgentRequest,
     FileContent,
     ImageContent,
+    MessageType,
     TextContent,
     VideoContent,
 )
@@ -103,7 +104,11 @@ _UPLOAD_ACK_TIMEOUT = 30.0  # seconds to wait for each upload ack
 # can start a fresh stream_id (issue #3947).
 _PROCESSING_REFRESH_INTERVAL = 20.0
 _PROCESSING_MAX_DURATION = 180.0
-_PROCESSING_TEXT = "🤔 Thinking..."
+_PROCESSING_TEXT = "🤔 思考中... /stop 可以随时打断我　　"
+_THINKING_PROCESSING_TEXT = "🤔 努力思考中... /stop 可以随时打断我　　"
+_TOOL_PROCESSING_TEXT = "🤖 执行工具中... /stop 可以随时打断我　　"
+_STOPPED_PROCESSING_TEXT = "⏹️ 已停止"
+_DONE_PROCESSING_TEXT = "✅ Done"
 
 # Map ContentType → wecom msgtype used in send_message.
 _MEDIA_MSGTYPE: Dict[str, str] = {
@@ -228,6 +233,9 @@ class WecomChannel(BaseChannel):
         # Keepalive tasks keyed by stream_id (kept off `meta` so the
         # payload stays JSON-serializable).
         self._keepalive_tasks: Dict[str, "asyncio.Task[None]"] = {}
+
+        # Keepalive status content keyed by stream_id.
+        self._processing_status: Dict[str, str] = {}
 
         # Sessions with in-flight model responses (suppress extra
         # "Thinking…" indicators).
@@ -1431,10 +1439,14 @@ class WecomChannel(BaseChannel):
                 await asyncio.sleep(interval)
                 elapsed += interval
                 try:
+                    content = self._processing_status.get(
+                        stream_id,
+                        _PROCESSING_TEXT,
+                    )
                     await self._client.reply_stream(
                         frame,
                         stream_id=stream_id,
-                        content=_PROCESSING_TEXT,
+                        content=content,
                         finish=False,
                     )
                 except Exception:
@@ -1444,10 +1456,14 @@ class WecomChannel(BaseChannel):
                     )
             # Close stream so next reply can use a fresh stream_id.
             try:
+                content = self._processing_status.get(
+                    stream_id,
+                    _PROCESSING_TEXT,
+                )
                 await self._client.reply_stream(
                     frame,
                     stream_id=stream_id,
-                    content=_PROCESSING_TEXT,
+                    content=content,
                     finish=True,
                 )
                 logger.info(
@@ -1461,6 +1477,7 @@ class WecomChannel(BaseChannel):
             return
         finally:
             self._keepalive_tasks.pop(stream_id, None)
+            self._processing_status.pop(stream_id, None)
 
     async def _send_text_via_frame(
         self,
@@ -1495,6 +1512,8 @@ class WecomChannel(BaseChannel):
 
     async def _before_consume_process(self, request: "AgentRequest") -> None:
         """Send 'Thinking…' placeholder stream (runs after ACL gate)."""
+        if self._suppress_processing_placeholders():
+            return
         meta = getattr(request, "channel_meta", None) or {}
         frame = meta.get("wecom_frame")
         has_text = bool(getattr(request, "input", None))
@@ -1515,9 +1534,15 @@ class WecomChannel(BaseChannel):
             return
 
         setattr(request, "_wecom_processing_stream_id", processing_stream_id)
+        self._processing_status[processing_stream_id] = _PROCESSING_TEXT
         self._keepalive_tasks[processing_stream_id] = asyncio.create_task(
             self._keepalive_processing(frame, processing_stream_id),
         )
+
+    def _suppress_processing_placeholders(self) -> bool:
+        """Whether to suppress WeCom processing placeholders."""
+
+        return False
 
     @staticmethod
     def _inject_processing_sid(
@@ -1551,8 +1576,48 @@ class WecomChannel(BaseChannel):
                 await keepalive_task
             except (asyncio.CancelledError, Exception):
                 pass
+            self._processing_status.pop(processing_sid, None)
             return processing_sid
         return generate_req_id("stream")
+
+    async def _update_processing_status(
+        self,
+        request: "AgentRequest",
+        send_meta: Dict[str, Any],
+        status_text: str,
+    ) -> None:
+        """更新隐藏中间事件对应的 WeCom 占位流。"""
+
+        if self._suppress_processing_placeholders():
+            return
+
+        sid = getattr(
+            request,
+            "_wecom_processing_stream_id",
+            "",
+        ) or send_meta.get("wecom_processing_stream_id", "")
+        frame = send_meta.get("wecom_frame")
+
+        if not sid:
+            if not (frame and self._client):
+                return
+            sid = generate_req_id("stream")
+            send_meta["wecom_processing_stream_id"] = sid
+            self._keepalive_tasks[sid] = asyncio.create_task(
+                self._keepalive_processing(frame, sid),
+            )
+
+        self._processing_status[sid] = status_text
+        if frame and self._client:
+            try:
+                await self._client.reply_stream(
+                    frame,
+                    stream_id=sid,
+                    content=status_text,
+                    finish=False,
+                )
+            except Exception:
+                logger.debug("wecom: failed to update processing status")
 
     def _get_streaming_sids(
         self,
@@ -1579,6 +1644,57 @@ class WecomChannel(BaseChannel):
             return f"{prefix}  {text}"
         return text
 
+    async def _ensure_streaming_sid(
+        self,
+        send_meta: Dict[str, Any],
+        stream_type: str,
+    ) -> str:
+        """Create a WeCom stream id only when non-empty text is ready."""
+
+        sids = self._get_streaming_sids(send_meta)
+        stream_id = sids.get(stream_type, "")
+        if stream_id:
+            return stream_id
+        if not sids:
+            stream_id = await self._cancel_keepalive_and_get_stream_id(
+                send_meta,
+            )
+        else:
+            stream_id = generate_req_id("stream")
+        sids[stream_type] = stream_id
+        return stream_id
+
+    async def _on_stream_msg_start(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        event: Any,
+        send_meta: Dict[str, Any],
+        msg_id_to_stream_type: Dict[str, str],
+        streaming_buffers: Dict[str, str],
+    ) -> bool:
+        """隐藏 reasoning 时用占位流承接进度。"""
+
+        stream_type = self._resolve_stream_type(event)
+        if (
+            stream_type == "reasoning"
+            and self._filter_thinking
+            and not self._suppress_processing_placeholders()
+        ):
+            await self._update_processing_status(
+                request,
+                send_meta,
+                _THINKING_PROCESSING_TEXT,
+            )
+        return await super()._on_stream_msg_start(
+            request,
+            to_handle,
+            event,
+            send_meta,
+            msg_id_to_stream_type,
+            streaming_buffers,
+        )
+
     async def on_streaming_start(
         self,
         request: "AgentRequest",
@@ -1588,24 +1704,9 @@ class WecomChannel(BaseChannel):
         stream_type: str,
         accumulated_text: str = "",
     ) -> None:
-        """Allocate a stream_id for this stream_type."""
+        """Register a stream segment without touching WeCom yet."""
         # Inject processing_stream_id created in _before_consume_process
         self._inject_processing_sid(request, send_meta)
-
-        frame = send_meta.get("wecom_frame")
-        if not frame or not self._client:
-            return
-
-        sids = self._get_streaming_sids(send_meta)
-
-        if not sids:
-            stream_id = await self._cancel_keepalive_and_get_stream_id(
-                send_meta,
-            )
-        else:
-            stream_id = generate_req_id("stream")
-
-        sids[stream_type] = stream_id
 
     async def on_streaming_delta(
         self,
@@ -1618,14 +1719,14 @@ class WecomChannel(BaseChannel):
     ) -> None:
         """Push an incremental update by overwriting the current bubble."""
         frame = send_meta.get("wecom_frame")
-        sids = self._get_streaming_sids(send_meta)
-        stream_id = sids.get(stream_type, "")
-        if not frame or not self._client or not stream_id:
+        text = accumulated_text.lstrip()
+        if not frame or not self._client or not text:
             return
 
+        stream_id = await self._ensure_streaming_sid(send_meta, stream_type)
         display_text = self._build_display_text(
             stream_type,
-            accumulated_text,
+            text,
             send_meta,
         )
 
@@ -1655,12 +1756,24 @@ class WecomChannel(BaseChannel):
         frame = send_meta.get("wecom_frame")
         sids = self._get_streaming_sids(send_meta)
         stream_id = sids.pop(stream_type, "")
-        if not frame or not self._client or not stream_id:
+        text = accumulated_text.lstrip()
+        if not frame or not self._client:
+            return
+        if not stream_id:
+            if not text:
+                return
+            stream_id = await self._ensure_streaming_sid(
+                send_meta,
+                stream_type,
+            )
+            self._get_streaming_sids(send_meta).pop(stream_type, None)
+
+        if not text:
             return
 
         display_text = self._build_display_text(
             stream_type,
-            accumulated_text,
+            text,
             send_meta,
         )
 
@@ -1705,6 +1818,74 @@ class WecomChannel(BaseChannel):
     # Interactive cards (tool_guard approval, etc.)
     # ------------------------------------------------------------------
 
+    async def _on_process_completed(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """处理完成后关闭尚未被最终回复复用的占位流。"""
+
+        self._inject_processing_sid(request, send_meta)
+        processing_sid = send_meta.pop("wecom_processing_stream_id", "")
+        if processing_sid:
+            keepalive_task = self._keepalive_tasks.pop(processing_sid, None)
+            if keepalive_task is not None and not keepalive_task.done():
+                keepalive_task.cancel()
+                try:
+                    await keepalive_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._processing_status.pop(processing_sid, None)
+            frame = send_meta.get("wecom_frame")
+            if frame and self._client:
+                try:
+                    await self._client.reply_stream(
+                        frame,
+                        stream_id=processing_sid,
+                        content=_DONE_PROCESSING_TEXT,
+                        finish=True,
+                    )
+                except Exception:
+                    logger.debug("wecom: failed to close placeholder stream")
+
+        await super()._on_process_completed(request, to_handle, send_meta)
+
+    async def _on_task_cancelled(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """任务取消时关闭 WeCom 占位流，避免聊天窗口残留空框。"""
+
+        del to_handle
+        self._inject_processing_sid(request, send_meta)
+        processing_sid = send_meta.pop("wecom_processing_stream_id", "")
+        if not processing_sid:
+            return
+
+        keepalive_task = self._keepalive_tasks.pop(processing_sid, None)
+        if keepalive_task is not None and not keepalive_task.done():
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._processing_status.pop(processing_sid, None)
+
+        frame = send_meta.get("wecom_frame")
+        if frame and self._client:
+            try:
+                await self._client.reply_stream(
+                    frame,
+                    stream_id=processing_sid,
+                    content=_STOPPED_PROCESSING_TEXT,
+                    finish=True,
+                )
+            except Exception:
+                logger.debug("wecom: failed to close placeholder on cancel")
+
     async def on_event_message_completed(
         self,
         request: "AgentRequest",
@@ -1715,6 +1896,28 @@ class WecomChannel(BaseChannel):
         """Render card-flagged events via the card handler; else default."""
         # Inject processing_stream_id for non-streaming path
         self._inject_processing_sid(request, send_meta)
+        msg_type = getattr(event, "type", None)
+        if not self._suppress_processing_placeholders():
+            if msg_type in (
+                MessageType.FUNCTION_CALL,
+                MessageType.PLUGIN_CALL,
+                MessageType.MCP_TOOL_CALL,
+                MessageType.FUNCTION_CALL_OUTPUT,
+                MessageType.PLUGIN_CALL_OUTPUT,
+                MessageType.MCP_TOOL_CALL_OUTPUT,
+            ):
+                await self._update_processing_status(
+                    request,
+                    send_meta,
+                    _TOOL_PROCESSING_TEXT,
+                )
+            elif msg_type == MessageType.REASONING and self._filter_thinking:
+                await self._update_processing_status(
+                    request,
+                    send_meta,
+                    _THINKING_PROCESSING_TEXT,
+                )
+
         if await self._card_handler.try_send_card_for_event(
             to_handle,
             event,
