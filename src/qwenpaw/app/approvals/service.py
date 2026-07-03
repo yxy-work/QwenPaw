@@ -17,6 +17,15 @@ from typing import TYPE_CHECKING, Any
 
 from ...constant import TOOL_GUARD_APPROVAL_TIMEOUT_SECONDS
 from ...security.tool_guard.approval import ApprovalDecision
+from ...schemas import (
+    ContentType,
+    Event,
+    MessageType,
+    Role,
+    RunStatus,
+    TextContent,
+)
+from .display import approval_display_fields
 from .models import ApprovalRequestSummary
 
 if TYPE_CHECKING:
@@ -74,10 +83,13 @@ class ApprovalService:
         self._lock = asyncio.Lock()
         self._pending: dict[str, PendingApproval] = {}
         self._channel_manager: Any | None = None
+        self._channel_managers: list[Any] = []
 
     def set_channel_manager(self, channel_manager: Any) -> None:
         """Store a reference to the channel manager for push notifications."""
         self._channel_manager = channel_manager
+        if channel_manager not in self._channel_managers:
+            self._channel_managers.append(channel_manager)
 
     # ------------------------------------------------------------------
     # Core approval lifecycle
@@ -135,6 +147,7 @@ class ApprovalService:
             session_id[:8],
             root_session_id[:8],
         )
+        self._schedule_channel_notification(pending)
 
         return pending
 
@@ -189,7 +202,138 @@ class ApprovalService:
             session_id[:8],
             root_session_id[:8],
         )
+        self._schedule_channel_notification(pending)
         return pending
+
+    # ------------------------------------------------------------------
+    # Channel notification
+    # ------------------------------------------------------------------
+
+    def _schedule_channel_notification(
+        self,
+        pending: PendingApproval,
+    ) -> None:
+        """异步通知外部 Channel 展示审批卡片。"""
+        if self._channel_manager is None:
+            return
+        if not pending.channel or not pending.session_id:
+            return
+        task = asyncio.create_task(self._notify_channel_pending(pending))
+        task.add_done_callback(self._log_channel_notification_result)
+
+    @staticmethod
+    def _log_channel_notification_result(
+        task: "asyncio.Task[None]",
+    ) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.debug("Approval channel notification cancelled")
+        except Exception:
+            logger.exception("Approval channel notification failed")
+
+    async def _notify_channel_pending(
+        self,
+        pending: PendingApproval,
+    ) -> None:
+        """向 ChannelManager 推送一个可由交互卡片处理器识别的事件。"""
+        channel_manager = await self._resolve_channel_manager(
+            pending.channel,
+        )
+        if channel_manager is None:
+            logger.warning(
+                "Approval channel notification skipped: channel not found: %s",
+                pending.channel,
+            )
+            return
+        event = self._build_approval_event(pending)
+        await channel_manager.send_event(
+            channel=pending.channel,
+            user_id=pending.user_id,
+            session_id=pending.session_id,
+            event=event,
+            meta={},
+        )
+
+    async def _resolve_channel_manager(self, channel: str) -> Any | None:
+        """选择包含目标 channel 的 ChannelManager。"""
+        managers = list(self._channel_managers)
+        if self._channel_manager is not None:
+            managers.append(self._channel_manager)
+
+        seen: set[int] = set()
+        legacy_fallback: Any | None = None
+        for manager in reversed(managers):
+            manager_id = id(manager)
+            if manager_id in seen:
+                continue
+            seen.add(manager_id)
+            get_channel = getattr(manager, "get_channel", None)
+            if get_channel is None:
+                if legacy_fallback is None:
+                    legacy_fallback = manager
+                continue
+            try:
+                result = get_channel(channel)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except Exception:
+                logger.debug(
+                    "Approval channel manager probe failed for channel=%s",
+                    channel,
+                    exc_info=True,
+                )
+                continue
+            if result is not None:
+                return manager
+        return legacy_fallback
+
+    @staticmethod
+    def _build_approval_event(pending: PendingApproval) -> Event:
+        """构造外部 Channel 可渲染的审批提示事件。"""
+        display = approval_display_fields(pending)
+        tool_name = display["tool_display_name"]
+        tool_source = display["tool_source"]
+        body_text = "\n".join(
+            [
+                "Tool approval required.",
+                f"Tool: {tool_name}",
+                f"Source: {tool_source}",
+                f"Severity: {pending.severity}",
+                f"Request ID: {pending.request_id}",
+                pending.result_summary,
+                "",
+                f"Approve: /approval approve {pending.request_id}",
+                f"Deny: /approval deny {pending.request_id}",
+            ],
+        ).strip()
+        return Event(
+            object="message",
+            status=RunStatus.Completed,
+            type=MessageType.MESSAGE,
+            role=Role.ASSISTANT,
+            content=[
+                TextContent(
+                    type=ContentType.TEXT,
+                    text=body_text,
+                    status=RunStatus.Completed,
+                ),
+            ],
+            metadata={
+                "metadata": {
+                    "message_type": "tool_guard_approval",
+                    "approval_request_id": pending.request_id,
+                    "tool_name": tool_name,
+                    "tool_source": tool_source,
+                    "severity": pending.severity,
+                    "findings_count": pending.findings_count,
+                    "result_summary": pending.result_summary,
+                    "agent_id": pending.agent_id,
+                    "session_id": pending.session_id,
+                    "root_session_id": pending.root_session_id,
+                },
+            },
+        )
 
     async def resolve_request(
         self,

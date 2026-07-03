@@ -35,6 +35,7 @@ from qwenpaw.schemas import (
     FileContent,
     ImageContent,
     MessageType,
+    RunStatus,
     TextContent,
     VideoContent,
 )
@@ -99,16 +100,16 @@ _UPLOAD_CMD_FINISH = "aibot_upload_media_finish"
 _UPLOAD_CMDS = (_UPLOAD_CMD_INIT, _UPLOAD_CMD_CHUNK, _UPLOAD_CMD_FINISH)
 _UPLOAD_ACK_TIMEOUT = 30.0  # seconds to wait for each upload ack
 
-# Keepalive for "🤔 Thinking..." stream: refresh to avoid WeCom
+# Keepalive for processing stream: refresh to avoid WeCom
 # server-side timeout; force-finish before the limit so later replies
 # can start a fresh stream_id (issue #3947).
 _PROCESSING_REFRESH_INTERVAL = 20.0
 _PROCESSING_MAX_DURATION = 180.0
-_PROCESSING_TEXT = "🤔 思考中... /stop 可以随时打断我　　"
-_THINKING_PROCESSING_TEXT = "🤔 努力思考中... /stop 可以随时打断我　　"
-_TOOL_PROCESSING_TEXT = "🤖 执行工具中... /stop 可以随时打断我　　"
-_STOPPED_PROCESSING_TEXT = "⏹️ 已停止"
-_DONE_PROCESSING_TEXT = "✅ Done"
+_PROCESSING_TEXT = "思考中... /stop 可以随时打断我　　"
+_THINKING_PROCESSING_TEXT = "努力思考中... /stop 可以随时打断我　　"
+_TOOL_PROCESSING_TEXT = "执行工具中... /stop 可以随时打断我　　"
+_STOPPED_PROCESSING_TEXT = "已停止"
+_DONE_PROCESSING_TEXT = "Done"
 
 # Map ContentType → wecom msgtype used in send_message.
 _MEDIA_MSGTYPE: Dict[str, str] = {
@@ -236,6 +237,7 @@ class WecomChannel(BaseChannel):
 
         # Keepalive status content keyed by stream_id.
         self._processing_status: Dict[str, str] = {}
+        self._processing_stream_sessions: Dict[str, Dict[str, Any]] = {}
 
         # Sessions with in-flight model responses (suppress extra
         # "Thinking…" indicators).
@@ -1535,6 +1537,12 @@ class WecomChannel(BaseChannel):
 
         setattr(request, "_wecom_processing_stream_id", processing_stream_id)
         self._processing_status[processing_stream_id] = _PROCESSING_TEXT
+        session_id = getattr(request, "session_id", "") or ""
+        if session_id:
+            self._processing_stream_sessions[session_id] = {
+                "stream_id": processing_stream_id,
+                "frame": frame,
+            }
         self._keepalive_tasks[processing_stream_id] = asyncio.create_task(
             self._keepalive_processing(frame, processing_stream_id),
         )
@@ -1555,6 +1563,47 @@ class WecomChannel(BaseChannel):
             if sid:
                 send_meta["wecom_processing_stream_id"] = sid
                 setattr(request, "_wecom_processing_stream_id", "")
+
+    def _forget_processing_stream_id(self, stream_id: str) -> None:
+        """移除指向指定占位流的 session 索引。"""
+        if not stream_id:
+            return
+        for session_id, record in list(self._processing_stream_sessions.items()):
+            if record.get("stream_id") == stream_id:
+                self._processing_stream_sessions.pop(session_id, None)
+
+    async def discard_processing_stream_for_session(
+        self,
+        session_id: str,
+        *,
+        content: str = "等待审批...",
+    ) -> None:
+        """结束并废弃指定 session 的旧占位流，避免后续回答复用其位置。"""
+        record = self._processing_stream_sessions.pop(session_id, None)
+        if not record:
+            return
+
+        stream_id = str(record.get("stream_id") or "")
+        frame = record.get("frame")
+        keepalive_task = self._keepalive_tasks.pop(stream_id, None)
+        if keepalive_task is not None and not keepalive_task.done():
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._processing_status.pop(stream_id, None)
+
+        if frame and self._client and stream_id:
+            try:
+                await self._client.reply_stream(
+                    frame,
+                    stream_id=stream_id,
+                    content=content,
+                    finish=True,
+                )
+            except Exception:
+                logger.debug("wecom: failed to discard processing stream")
 
     # ------------------------------------------------------------------
     # Streaming hooks (real-time delta push via reply_stream)
@@ -1577,7 +1626,9 @@ class WecomChannel(BaseChannel):
             except (asyncio.CancelledError, Exception):
                 pass
             self._processing_status.pop(processing_sid, None)
+            self._forget_processing_stream_id(processing_sid)
             return processing_sid
+        self._forget_processing_stream_id(processing_sid)
         return generate_req_id("stream")
 
     async def _update_processing_status(
@@ -1829,6 +1880,7 @@ class WecomChannel(BaseChannel):
         self._inject_processing_sid(request, send_meta)
         processing_sid = send_meta.pop("wecom_processing_stream_id", "")
         if processing_sid:
+            self._forget_processing_stream_id(processing_sid)
             keepalive_task = self._keepalive_tasks.pop(processing_sid, None)
             if keepalive_task is not None and not keepalive_task.done():
                 keepalive_task.cancel()
@@ -1866,6 +1918,7 @@ class WecomChannel(BaseChannel):
             return
 
         keepalive_task = self._keepalive_tasks.pop(processing_sid, None)
+        self._forget_processing_stream_id(processing_sid)
         if keepalive_task is not None and not keepalive_task.done():
             keepalive_task.cancel()
             try:
@@ -1930,6 +1983,43 @@ class WecomChannel(BaseChannel):
             event,
             send_meta,
         )
+
+    async def send_event(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        event: Any,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """主动发送 runner event，优先渲染 WeCom 交互卡片。"""
+        obj = getattr(event, "object", None)
+        status = getattr(event, "status", None)
+        if obj != "message" or status != RunStatus.Completed:
+            return
+
+        to_handle = self.to_handle_from_target(
+            user_id=user_id,
+            session_id=session_id,
+        )
+        send_meta = dict(meta or {})
+        send_meta.setdefault("session_id", session_id)
+        send_meta.setdefault("user_id", user_id)
+        send_meta.setdefault("wecom_sender_id", user_id)
+        send_meta.setdefault("wecom_chatid", self._parse_chatid_from_handle(
+            to_handle,
+        ))
+        send_meta.setdefault(
+            "wecom_chat_type",
+            "group" if to_handle.startswith("wecom:group:") else "single",
+        )
+        if await self._card_handler.try_send_card_for_event(
+            to_handle,
+            event,
+            send_meta,
+        ):
+            return
+        await self.send_message_content(to_handle, event, send_meta)
 
     async def send_content_parts(  # pylint: disable=too-many-locals
         self,
@@ -2019,12 +2109,12 @@ class WecomChannel(BaseChannel):
         # clear it with an empty finish before sending media.
         if processing_sid and first_chunk and frame:
             try:
-                await self._client.reply_stream(
-                    frame,
-                    stream_id=processing_sid,
-                    content="✅ Done",
-                    finish=True,
-                )
+                    await self._client.reply_stream(
+                        frame,
+                        stream_id=processing_sid,
+                        content=_DONE_PROCESSING_TEXT,
+                        finish=True,
+                    )
             except Exception:
                 logger.debug("wecom: failed to clear processing indicator")
 

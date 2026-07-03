@@ -142,6 +142,15 @@ async def create_channel_service(ws: "Workspace", _):
         workspace_dir=ws.workspace_dir,
     )
     ws._service_manager.services["channel_manager"] = cm
+    try:
+        from ..approvals import get_approval_service
+
+        get_approval_service().set_channel_manager(cm)
+    except Exception:
+        logger.debug(
+            "Approval service channel manager registration skipped",
+            exc_info=True,
+        )
 
     cm.set_workspace(ws)
 
