@@ -1,0 +1,36 @@
+services:
+  qwenpaw-persistent:
+    image: qwenpaw-custom:2.0.0b1-wecom
+    container_name: qwenpaw-persistent
+    restart: unless-stopped
+    network_mode: host
+    runtime: nvidia
+    env_file:
+      - .env.qwenpaw-persistent
+    environment:
+      QWENPAW_PORT: "8089"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      NO_PROXY: "*"
+      http_proxy: ""
+      https_proxy: ""
+      all_proxy: ""
+      no_proxy: "*"
+    volumes:
+      - qwenpaw-persistent-data:/app/working
+      - qwenpaw-persistent-secrets:/app/working.secret
+      - qwenpaw-persistent-backups:/app/working.backups
+
+      - /home/yangxinyu/Test/anaconda3:/home/yangxinyu/Test/anaconda3:ro
+      - /home/yangxinyu/Test/Projects/KnowledgeBase:/home/yangxinyu/Test/Projects/KnowledgeBase
+
+volumes:
+  qwenpaw-persistent-data:
+    name: qwenpaw-persistent-data
+  qwenpaw-persistent-secrets:
+    name: qwenpaw-persistent-secrets
+  qwenpaw-persistent-backups:
+    name: qwenpaw-persistent-backups

@@ -47,8 +47,6 @@ website/dist/
 website/public/search-index.json
 
 # misc
-.env
-.env.*
 providers.json
 envs.json
 !.env.example
