@@ -904,6 +904,14 @@ class WecomChannel(BaseChannel):
     def _build_kb_process_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self._kb_ingest_cuda_visible_devices
+        kb_cli_parent = self._kb_cli_path.expanduser().parent
+        if kb_cli_parent:
+            existing_path = env.get("PATH", "")
+            env["PATH"] = (
+                str(kb_cli_parent)
+                if not existing_path
+                else os.pathsep.join([str(kb_cli_parent), existing_path])
+            )
         env.update(self._kb_ingest_extra_env)
         return env
 

@@ -45,6 +45,8 @@ RUN apt-get update && apt-get install -y --fix-missing \
     supervisor  \
     vim  \
     gettext-base \
+    libreoffice \
+    poppler-utils \
     xfce4 \
     xfce4-terminal \
     xvfb \
