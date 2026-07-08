@@ -1076,8 +1076,20 @@ class WecomChannel(BaseChannel):
                     f"知识库名称：{kb_name}\n"
                     f"后台进程 PID：{process.pid}\n"
                     f"退出码：{return_code}\n"
+                    "自动启动垃圾清理……\n"
                     f"日志：{log_path}"
                 ),
+            )
+            prune_result = await self._run_kb_prune_apply(
+                kb_name=kb_name,
+                log_path=log_path,
+            )
+            await self._send_kb_prune_completion_report(
+                prune_result=prune_result,
+                kb_name=kb_name,
+                log_path=log_path,
+                frame=frame,
+                chatid=chatid,
             )
             return
 
@@ -1165,8 +1177,20 @@ class WecomChannel(BaseChannel):
                     f"解压目录：{source_dir}\n"
                     f"知识库名称：{kb_name}\n"
                     f"错误：{exc}\n"
+                    "自动启动垃圾清理……\n"
                     f"日志：{log_path}"
                 ),
+            )
+            prune_result = await self._run_kb_prune_apply(
+                kb_name=kb_name,
+                log_path=log_path,
+            )
+            await self._send_kb_prune_completion_report(
+                prune_result=prune_result,
+                kb_name=kb_name,
+                log_path=log_path,
+                frame=frame,
+                chatid=chatid,
             )
             return
 
@@ -1178,8 +1202,20 @@ class WecomChannel(BaseChannel):
                     "知识库建库进程已完成，但 kb list 未发现目标知识库。\n"
                     f"解压目录：{source_dir}\n"
                     f"知识库名称：{kb_name}\n"
+                    "自动启动垃圾清理……\n"
                     f"日志：{log_path}"
                 ),
+            )
+            prune_result = await self._run_kb_prune_apply(
+                kb_name=kb_name,
+                log_path=log_path,
+            )
+            await self._send_kb_prune_completion_report(
+                prune_result=prune_result,
+                kb_name=kb_name,
+                log_path=log_path,
+                frame=frame,
+                chatid=chatid,
             )
             return
 
@@ -1223,6 +1259,115 @@ class WecomChannel(BaseChannel):
                 "kb list --json 输出不是有效 JSON: "
                 f"{stdout_text[:1000]}"
             ) from exc
+
+    async def _run_kb_prune_apply(
+        self,
+        kb_name: str,
+        log_path: Path,
+    ) -> dict[str, Any]:
+        command = self._build_kb_command(
+            "prune",
+            "--kb-name",
+            kb_name,
+            "--apply",
+        )
+        logger.info("wecom kb prune command=%s", command)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self._build_kb_process_env(),
+            cwd=str(self._kb_project_dir),
+        )
+        stdout, stderr = await process.communicate()
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        self._append_kb_command_log(
+            log_path=log_path,
+            title="kb prune --apply",
+            command=command,
+            return_code=process.returncode,
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+        )
+        return {
+            "return_code": process.returncode,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+        }
+
+    @staticmethod
+    def _append_kb_command_log(
+        *,
+        log_path: Path,
+        title: str,
+        command: list[str],
+        return_code: int | None,
+        stdout_text: str,
+        stderr_text: str,
+    ) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write("\n\n")
+            log_file.write(f"===== {title} =====\n")
+            log_file.write(f"command: {json.dumps(command, ensure_ascii=False)}\n")
+            log_file.write(f"return_code: {return_code}\n")
+            if stdout_text:
+                log_file.write("stdout:\n")
+                log_file.write(stdout_text)
+                if not stdout_text.endswith("\n"):
+                    log_file.write("\n")
+            if stderr_text:
+                log_file.write("stderr:\n")
+                log_file.write(stderr_text)
+                if not stderr_text.endswith("\n"):
+                    log_file.write("\n")
+
+    @staticmethod
+    def _format_kb_prune_result(prune_result: dict[str, Any]) -> str:
+        return_code = prune_result.get("return_code")
+        stderr_text = str(prune_result.get("stderr") or "").strip()
+        if return_code == 0:
+            return "已自动执行清理：kb prune --apply 成功，prune 退出码：0。"
+        if stderr_text:
+            return (
+                "已自动执行清理：kb prune --apply 失败，"
+                f"prune 退出码：{return_code}，错误：{stderr_text[:500]}。"
+            )
+        return (
+            "已自动执行清理：kb prune --apply 失败，"
+            f"prune 退出码：{return_code}。"
+        )
+
+    async def _send_kb_prune_completion_report(
+        self,
+        *,
+        prune_result: dict[str, Any],
+        kb_name: str,
+        log_path: Path,
+        frame: Any,
+        chatid: str,
+    ) -> None:
+        return_code = prune_result.get("return_code")
+        if return_code == 0:
+            text = (
+                "已清除不完整的知识库与解析缓存。\n"
+                f"知识库名称：{kb_name}\n"
+                "prune 退出码：0\n"
+                f"日志：{log_path}"
+            )
+        else:
+            text = (
+                "垃圾清理执行失败。\n"
+                f"知识库名称：{kb_name}\n"
+                f"{self._format_kb_prune_result(prune_result)}\n"
+                f"日志：{log_path}"
+            )
+        await self._send_background_text(
+            frame=frame,
+            chatid=chatid,
+            text=text,
+        )
 
     @staticmethod
     def _find_knowledgebase(
