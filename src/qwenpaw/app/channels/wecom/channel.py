@@ -86,7 +86,15 @@ _ARCHIVE_UPLOAD_ACK_PROMPT = (
     "请直接回答：文件已上传成功，后台路径：{path}。"
     "文件将被解压并进一步建立知识库"
 )
+_DEFAULT_KB_PROJECT_DIR = Path(
+    "/home/yangxinyu/Test/Projects/KnowledgeBase-persistent",
+)
 _DEFAULT_KB_CLI_PATH = Path("/home/yangxinyu/Test/anaconda3/envs/KB/bin/kb")
+_DEFAULT_KB_PROCESS_HOME = Path("/app/working")
+_DEFAULT_KB_PROCESS_CACHE_HOME = _DEFAULT_KB_PROCESS_HOME / ".cache"
+_DEFAULT_KB_PROCESS_NLTK_DATA = (
+    _DEFAULT_KB_PROCESS_CACHE_HOME / "knowledgebase" / "nltk_data"
+)
 _KB_INGEST_CUDA_VISIBLE_DEVICES = "2,3"
 _KB_INGEST_POLL_INTERVAL_SECONDS = 30.0
 _KB_INGEST_LOG_DIR_NAME = "kb_ingest_logs"
@@ -208,6 +216,9 @@ class WecomChannel(BaseChannel):
         self._kb_cli_path = Path(
             os.getenv("QWENPAW_KB_CLI_PATH", str(_DEFAULT_KB_CLI_PATH)),
         ).expanduser()
+        self._kb_command_json = os.getenv("QWENPAW_KB_COMMAND_JSON", "").strip()
+        self._kb_config_path = os.getenv("QWENPAW_KB_CONFIG_PATH", "").strip()
+        self._kb_pythonpath = os.getenv("QWENPAW_KB_PYTHONPATH", "").strip()
         self._kb_ingest_cuda_visible_devices = os.getenv(
             "QWENPAW_KB_INGEST_CUDA_VISIBLE_DEVICES",
             _KB_INGEST_CUDA_VISIBLE_DEVICES,
@@ -221,7 +232,25 @@ class WecomChannel(BaseChannel):
         self._kb_project_dir = Path(
             os.getenv(
                 "QWENPAW_KB_PROJECT_DIR",
-                "/home/yangxinyu/Test/Projects/KnowledgeBase",
+                str(_DEFAULT_KB_PROJECT_DIR),
+            ),
+        ).expanduser()
+        self._kb_process_home = Path(
+            os.getenv(
+                "QWENPAW_KB_HOME",
+                str(_DEFAULT_KB_PROCESS_HOME),
+            ),
+        ).expanduser()
+        self._kb_process_cache_home = Path(
+            os.getenv(
+                "QWENPAW_KB_XDG_CACHE_HOME",
+                str(_DEFAULT_KB_PROCESS_CACHE_HOME),
+            ),
+        ).expanduser()
+        self._kb_process_nltk_data = Path(
+            os.getenv(
+                "QWENPAW_KB_NLTK_DATA",
+                str(_DEFAULT_KB_PROCESS_NLTK_DATA),
             ),
         ).expanduser()
         self._kb_ingest_extra_env: Dict[str, str] = {}
@@ -892,6 +921,40 @@ class WecomChannel(BaseChannel):
             f"{configured_path} 存在。"
         )
 
+    def _resolve_kb_command_prefix(self) -> list[str]:
+        if self._kb_command_json:
+            try:
+                command_prefix = json.loads(self._kb_command_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "QWENPAW_KB_COMMAND_JSON 必须是 JSON array 字符串。"
+                ) from exc
+            if (
+                not isinstance(command_prefix, list)
+                or not command_prefix
+                or not all(
+                    isinstance(item, str) and item
+                    for item in command_prefix
+                )
+            ):
+                raise ValueError(
+                    "QWENPAW_KB_COMMAND_JSON 必须是非空 string list。"
+                )
+            return command_prefix
+
+        return [str(self._resolve_kb_cli_path())]
+
+    def _build_kb_command(self, *args: str) -> list[str]:
+        command = [*self._resolve_kb_command_prefix()]
+        if not args:
+            return command
+
+        command.append(args[0])
+        if self._kb_config_path and "--config" not in args:
+            command.extend(["--config", self._kb_config_path])
+        command.extend(args[1:])
+        return command
+
     def _build_kb_ingest_log_path(self, kb_name: str) -> Path:
         log_dir = self._media_dir / _KB_INGEST_LOG_DIR_NAME
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -904,8 +967,40 @@ class WecomChannel(BaseChannel):
     def _build_kb_process_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self._kb_ingest_cuda_visible_devices
-        kb_cli_parent = self._kb_cli_path.expanduser().parent
-        if kb_cli_parent:
+        env["HOME"] = str(self._kb_process_home)
+        env["XDG_CACHE_HOME"] = str(self._kb_process_cache_home)
+        env["NLTK_DATA"] = str(self._kb_process_nltk_data)
+        if self._kb_config_path:
+            env["KB_CONFIG_PATH"] = self._kb_config_path
+
+        pythonpath_parts: list[str] = []
+        if self._kb_pythonpath:
+            pythonpath_parts.extend(
+                part
+                for part in self._kb_pythonpath.split(os.pathsep)
+                if part
+            )
+        else:
+            pythonpath_parts.extend(
+                [
+                    str(self._kb_project_dir),
+                    str(self._kb_project_dir / "MinerU"),
+                ],
+            )
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        if existing_pythonpath:
+            pythonpath_parts.extend(
+                part
+                for part in existing_pythonpath.split(os.pathsep)
+                if part
+            )
+        if pythonpath_parts:
+            env["PYTHONPATH"] = os.pathsep.join(
+                dict.fromkeys(pythonpath_parts),
+            )
+
+        if not self._kb_command_json:
+            kb_cli_parent = self._kb_cli_path.expanduser().parent
             existing_path = env.get("PATH", "")
             env["PATH"] = (
                 str(kb_cli_parent)
@@ -931,9 +1026,7 @@ class WecomChannel(BaseChannel):
         log_path = self._build_kb_ingest_log_path(kb_name)
 
         try:
-            kb_cli_path = self._resolve_kb_cli_path()
             process = await self._start_kb_ingest_process(
-                kb_cli_path=kb_cli_path,
                 source_dir=source_dir,
                 kb_name=kb_name,
                 log_path=log_path,
@@ -998,13 +1091,11 @@ class WecomChannel(BaseChannel):
 
     async def _start_kb_ingest_process(
         self,
-        kb_cli_path: Path,
         source_dir: Path,
         kb_name: str,
         log_path: Path,
     ) -> "asyncio.subprocess.Process":
-        command = [
-            str(kb_cli_path),
+        command = self._build_kb_command(
             "ingest",
             "--source",
             str(source_dir),
@@ -1012,7 +1103,7 @@ class WecomChannel(BaseChannel):
             kb_name,
             "--apply",
             "--parse-image",
-        ]
+        )
         logger.info("wecom kb ingest command=%s", command)
         with log_path.open("ab") as log_file:
             process = await asyncio.create_subprocess_exec(
@@ -1109,11 +1200,9 @@ class WecomChannel(BaseChannel):
         )
 
     async def _run_kb_list_json(self) -> dict[str, Any]:
-        kb_cli_path = self._resolve_kb_cli_path()
+        command = self._build_kb_command("list", "--json")
         process = await asyncio.create_subprocess_exec(
-            str(kb_cli_path),
-            "list",
-            "--json",
+            *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._build_kb_process_env(),

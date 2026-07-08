@@ -1505,23 +1505,41 @@ class MCPClientConfig(BaseModel):
         return self
 
 
+def _default_mcp_clients() -> Dict[str, MCPClientConfig]:
+    return {
+        "knowledgebase_persistent": MCPClientConfig(
+            name="KnowledgeBase Persistent",
+            description=(
+                "Search the persistent KnowledgeBase service through "
+                "streamable HTTP MCP."
+            ),
+            enabled=True,
+            transport="streamable_http",
+            url="http://127.0.0.1:18776/mcp",
+            headers={},
+            command="",
+            args=[],
+            env={},
+            cwd="/home/yangxinyu/Test/Projects/KnowledgeBase-persistent",
+        ),
+        "tavily_search": MCPClientConfig(
+            name="tavily_mcp",
+            enabled=False,
+            command="npx",
+            args=["-y", "tavily-mcp@latest"],
+            env={"TAVILY_API_KEY": ""},
+        ),
+    }
+
+
 class MCPConfig(BaseModel):
     """MCP clients configuration.
 
     Uses a dict to allow dynamic client definitions.
-    Default tavily_search client is created and auto-enabled if API key exists.
     """
 
     clients: Dict[str, MCPClientConfig] = Field(
-        default_factory=lambda: {
-            "tavily_search": MCPClientConfig(
-                name="tavily_mcp",
-                enabled=False,
-                command="npx",
-                args=["-y", "tavily-mcp@latest"],
-                env={"TAVILY_API_KEY": ""},
-            ),
-        },
+        default_factory=_default_mcp_clients,
     )
 
 

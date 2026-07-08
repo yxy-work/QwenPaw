@@ -20,6 +20,9 @@ FROM ${NODE_IMAGE}
 
 # ENV variables
 ENV NODE_ENV=production
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV LANGUAGE=C.UTF-8
 ENV WORKSPACE_DIR=/app
 ENV QWENPAW_WORKING_DIR=/app/working
 ENV QWENPAW_SECRET_DIR=/app/working.secret
@@ -33,6 +36,10 @@ ARG QWENPAW_ENABLED_CHANNELS=""
 ENV QWENPAW_ENABLED_CHANNELS=${QWENPAW_ENABLED_CHANNELS}
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG QWENPAW_HOST_UID=1009
+ARG QWENPAW_HOST_GID=1010
+ARG QWENPAW_HOST_USER=yangxinyu
+ARG QWENPAW_HOST_GROUP=yangxinyu
 
 RUN apt-get update && apt-get install -y --fix-missing \
     curl  \
@@ -44,6 +51,7 @@ RUN apt-get update && apt-get install -y --fix-missing \
     git  \
     supervisor  \
     vim  \
+    util-linux \
     gettext-base \
     libreoffice \
     poppler-utils \
@@ -55,6 +63,20 @@ RUN apt-get update && apt-get install -y --fix-missing \
     fonts-wqy-microhei \
   && rm -rf /var/lib/apt/lists/* \
   && apt-get clean
+
+RUN set -eux; \
+    if ! getent group "${QWENPAW_HOST_GID}" >/dev/null; then \
+        groupadd -g "${QWENPAW_HOST_GID}" "${QWENPAW_HOST_GROUP}"; \
+    fi; \
+    if ! getent passwd "${QWENPAW_HOST_UID}" >/dev/null; then \
+        useradd \
+            -u "${QWENPAW_HOST_UID}" \
+            -g "${QWENPAW_HOST_GID}" \
+            -d /app/working \
+            -s /usr/sbin/nologin \
+            -M \
+            "${QWENPAW_HOST_USER}"; \
+    fi
 
 
 RUN apt-get update && apt-get install -y --fix-missing \

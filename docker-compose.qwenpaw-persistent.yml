@@ -1,6 +1,14 @@
 services:
   qwenpaw-persistent:
-    image: qwenpaw-custom:2.0.0b1-wecom
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        QWENPAW_HOST_UID: "1009"
+        QWENPAW_HOST_GID: "1010"
+        QWENPAW_HOST_USER: yangxinyu
+        QWENPAW_HOST_GROUP: yangxinyu
+    image: qwenpaw-persistent:2.0.0b1-wecom
     container_name: qwenpaw-persistent
     restart: unless-stopped
     network_mode: host
@@ -9,6 +17,9 @@ services:
       - .env.qwenpaw-persistent
     environment:
       QWENPAW_PORT: "8089"
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      LANGUAGE: C.UTF-8
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       HTTP_PROXY: ""
@@ -25,7 +36,7 @@ services:
       - qwenpaw-persistent-backups:/app/working.backups
 
       - /home/yangxinyu/Test/anaconda3:/home/yangxinyu/Test/anaconda3:ro
-      - /home/yangxinyu/Test/Projects/KnowledgeBase:/home/yangxinyu/Test/Projects/KnowledgeBase
+      - /home/yangxinyu/Test/Projects/KnowledgeBase-persistent:/home/yangxinyu/Test/Projects/KnowledgeBase-persistent
 
 volumes:
   qwenpaw-persistent-data:
