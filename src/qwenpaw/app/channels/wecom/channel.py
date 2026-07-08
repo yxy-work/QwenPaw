@@ -974,10 +974,6 @@ class WecomChannel(BaseChannel):
             kb_name=kb_name,
         )
         if return_code != 0:
-            prune_result = await self._run_kb_prune_apply(
-                kb_name=kb_name,
-                log_path=log_path,
-            )
             await self._send_background_text(
                 frame=frame,
                 chatid=chatid,
@@ -987,9 +983,20 @@ class WecomChannel(BaseChannel):
                     f"知识库名称：{kb_name}\n"
                     f"后台进程 PID：{process.pid}\n"
                     f"退出码：{return_code}\n"
-                    f"{self._format_kb_prune_result(prune_result)}\n"
+                    "自动启动垃圾清理……\n"
                     f"日志：{log_path}"
                 ),
+            )
+            prune_result = await self._run_kb_prune_apply(
+                kb_name=kb_name,
+                log_path=log_path,
+            )
+            await self._send_kb_prune_completion_report(
+                prune_result=prune_result,
+                kb_name=kb_name,
+                log_path=log_path,
+                frame=frame,
+                chatid=chatid,
             )
             return
 
@@ -1071,10 +1078,6 @@ class WecomChannel(BaseChannel):
             matched_kb = self._find_knowledgebase(payload, kb_name)
         except Exception as exc:
             logger.exception("wecom kb list failed kb_name=%s", kb_name)
-            prune_result = await self._run_kb_prune_apply(
-                kb_name=kb_name,
-                log_path=log_path,
-            )
             await self._send_background_text(
                 frame=frame,
                 chatid=chatid,
@@ -1083,17 +1086,24 @@ class WecomChannel(BaseChannel):
                     f"解压目录：{source_dir}\n"
                     f"知识库名称：{kb_name}\n"
                     f"错误：{exc}\n"
-                    f"{self._format_kb_prune_result(prune_result)}\n"
+                    "自动启动垃圾清理……\n"
                     f"日志：{log_path}"
                 ),
             )
-            return
-
-        if not matched_kb:
             prune_result = await self._run_kb_prune_apply(
                 kb_name=kb_name,
                 log_path=log_path,
             )
+            await self._send_kb_prune_completion_report(
+                prune_result=prune_result,
+                kb_name=kb_name,
+                log_path=log_path,
+                frame=frame,
+                chatid=chatid,
+            )
+            return
+
+        if not matched_kb:
             await self._send_background_text(
                 frame=frame,
                 chatid=chatid,
@@ -1101,9 +1111,20 @@ class WecomChannel(BaseChannel):
                     "知识库建库进程已完成，但 kb list 未发现目标知识库。\n"
                     f"解压目录：{source_dir}\n"
                     f"知识库名称：{kb_name}\n"
-                    f"{self._format_kb_prune_result(prune_result)}\n"
+                    "自动启动垃圾清理……\n"
                     f"日志：{log_path}"
                 ),
+            )
+            prune_result = await self._run_kb_prune_apply(
+                kb_name=kb_name,
+                log_path=log_path,
+            )
+            await self._send_kb_prune_completion_report(
+                prune_result=prune_result,
+                kb_name=kb_name,
+                log_path=log_path,
+                frame=frame,
+                chatid=chatid,
             )
             return
 
@@ -1229,6 +1250,36 @@ class WecomChannel(BaseChannel):
         return (
             "已自动执行清理：kb prune --apply 失败，"
             f"prune 退出码：{return_code}。"
+        )
+
+    async def _send_kb_prune_completion_report(
+        self,
+        *,
+        prune_result: dict[str, Any],
+        kb_name: str,
+        log_path: Path,
+        frame: Any,
+        chatid: str,
+    ) -> None:
+        return_code = prune_result.get("return_code")
+        if return_code == 0:
+            text = (
+                "已清除不完整的知识库与解析缓存。\n"
+                f"知识库名称：{kb_name}\n"
+                "prune 退出码：0\n"
+                f"日志：{log_path}"
+            )
+        else:
+            text = (
+                "垃圾清理执行失败。\n"
+                f"知识库名称：{kb_name}\n"
+                f"{self._format_kb_prune_result(prune_result)}\n"
+                f"日志：{log_path}"
+            )
+        await self._send_background_text(
+            frame=frame,
+            chatid=chatid,
+            text=text,
         )
 
     @staticmethod
