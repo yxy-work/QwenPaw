@@ -333,6 +333,7 @@ class WecomConfig(BaseChannelConfig):
     share_session_in_group: bool = True
     max_reconnect_attempts: int = -1
     streaming_enabled: bool = False
+    warn_context_usage: bool = True
 
 
 class MatrixConfig(BaseChannelConfig):
@@ -737,7 +738,7 @@ class ContextCompactConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = Field(
-        default=True,
+        default=False,
         description="Whether to enable automatic context compaction",
     )
 
@@ -909,11 +910,11 @@ class LightContextConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     strategy: Literal["native", "scroll"] = Field(
-        default="scroll",
+        default="native",
         description=(
             "Context management strategy. 'native' = AgentScope compression; "
             "'scroll' = retrieval-driven history.db + eviction index with a "
-            "sandboxed execute_python recall REPL (the default)."
+            "sandboxed execute_python recall REPL."
         ),
     )
 

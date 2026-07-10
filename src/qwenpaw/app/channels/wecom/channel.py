@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -110,6 +111,16 @@ _THINKING_PROCESSING_TEXT = "努力思考中... /stop 可以随时打断我　�
 _TOOL_PROCESSING_TEXT = "执行工具中... /stop 可以随时打断我　　"
 _STOPPED_PROCESSING_TEXT = "已停止"
 _DONE_PROCESSING_TEXT = "Done"
+_CONTEXT_USAGE_NEAR_LIMIT_RATIO = 75.0
+_CONTEXT_USAGE_OVER_LIMIT_RATIO = 95.0
+_CONTEXT_USAGE_NEAR_LIMIT_TEXT = (
+    "当前对话长度已接近上下文窗口上限，建议输入/clear并回车以重置上下文"
+    "（聊天记录仍会保留在企业微信中）"
+)
+_CONTEXT_USAGE_OVER_LIMIT_TEXT = (
+    "当前对话长度已超出最优上下文窗口，请尽快输入/clear并回车以重置上下文"
+    "（聊天记录仍会保留在企业微信中）"
+)
 
 # Map ContentType → wecom msgtype used in send_message.
 _MEDIA_MSGTYPE: Dict[str, str] = {
@@ -171,6 +182,7 @@ class WecomChannel(BaseChannel):
         deny_message: str = "",
         max_reconnect_attempts: int = -1,
         streaming_enabled: bool = False,
+        warn_context_usage: bool = True,
         access_control_dm: bool = False,
         access_control_group: bool = False,
     ):
@@ -194,6 +206,7 @@ class WecomChannel(BaseChannel):
         self.bot_prefix = bot_prefix
         self.welcome_text = welcome_text
         self.share_session_in_group = share_session_in_group
+        self.warn_context_usage = warn_context_usage
         self._workspace_dir = (
             Path(workspace_dir).expanduser() if workspace_dir else None
         )
@@ -286,6 +299,9 @@ class WecomChannel(BaseChannel):
             max_reconnect_attempts=int(
                 os.getenv("WECOM_MAX_RECONNECT_ATTEMPTS", "-1"),
             ),
+            warn_context_usage=(
+                os.getenv("WECOM_WARN_CONTEXT_USAGE", "1") == "1"
+            ),
         )
 
     @classmethod
@@ -299,6 +315,7 @@ class WecomChannel(BaseChannel):
         filter_thinking: bool = False,
         workspace_dir: Path | None = None,
     ) -> "WecomChannel":
+        warn_context_usage = getattr(config, "warn_context_usage", True)
         return cls(
             process=process,
             enabled=getattr(config, "enabled", False),
@@ -328,6 +345,11 @@ class WecomChannel(BaseChannel):
             ),
             streaming_enabled=bool(
                 getattr(config, "streaming_enabled", False),
+            ),
+            warn_context_usage=(
+                True
+                if warn_context_usage is None
+                else bool(warn_context_usage)
             ),
             access_control_dm=bool(
                 getattr(config, "access_control_dm", False),
@@ -2007,6 +2029,89 @@ class WecomChannel(BaseChannel):
     # Session processing state management
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _build_context_usage_warning(ratio: float) -> str | None:
+        """根据上下文窗口占用比例返回告警文案。"""
+        if not math.isfinite(ratio):
+            return None
+        if ratio >= _CONTEXT_USAGE_OVER_LIMIT_RATIO:
+            return _CONTEXT_USAGE_OVER_LIMIT_TEXT
+        if ratio >= _CONTEXT_USAGE_NEAR_LIMIT_RATIO:
+            return _CONTEXT_USAGE_NEAR_LIMIT_TEXT
+        return None
+
+    async def _estimate_context_usage_ratio(
+        self,
+        request: "AgentRequest",
+    ) -> float | None:
+        """读取当前 WeCom session state 并估算上下文窗口占用比例。"""
+        workspace = self._workspace
+        session = getattr(workspace, "session", None) if workspace else None
+        session_id = getattr(request, "session_id", "") or ""
+        if session is None or not session_id:
+            return None
+
+        user_id = getattr(request, "user_id", "") or session_id
+        channel = getattr(request, "channel", "") or self.channel
+        agent_id = getattr(workspace, "agent_id", "default") or "default"
+
+        try:
+            state = await session.get_session_state_dict(
+                session_id=session_id,
+                user_id=user_id,
+                channel=channel,
+                allow_not_exist=True,
+            )
+            agent_raw = state.get("agent", {}) if state else {}
+            state_raw = agent_raw.get("state")
+            if not isinstance(state_raw, dict):
+                return None
+
+            from agentscope.state import AgentState
+
+            from ....token_usage.turn_usage import (
+                snapshot_context_usage_for_state,
+            )
+
+            agent_state = AgentState.model_validate(state_raw)
+            usage = await snapshot_context_usage_for_state(
+                agent_state,
+                agent_id,
+            )
+            if not usage:
+                return None
+            ratio = float(usage.get("context_usage_ratio", 0) or 0)
+            return ratio if math.isfinite(ratio) else None
+        except Exception:
+            logger.warning(
+                "wecom 上下文窗口估算失败：session_id=%s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _warn_context_usage_if_needed(
+        self,
+        request: "AgentRequest",
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """在每轮成功回复后按当前比例发送上下文窗口告警。"""
+        if not self.warn_context_usage:
+            return
+
+        ratio = await self._estimate_context_usage_ratio(request)
+        if ratio is None:
+            return
+        warning_text = self._build_context_usage_warning(ratio)
+        if warning_text is None:
+            return
+
+        await self._send_background_text(
+            frame=send_meta.get("wecom_frame"),
+            chatid=str(send_meta.get("wecom_chatid") or ""),
+            text=warning_text,
+        )
+
     async def _consume_with_tracker(
         self,
         request: "AgentRequest",
@@ -2056,6 +2161,7 @@ class WecomChannel(BaseChannel):
                 except Exception:
                     logger.debug("wecom: failed to close placeholder stream")
 
+        await self._warn_context_usage_if_needed(request, send_meta)
         await super()._on_process_completed(request, to_handle, send_meta)
 
     async def _on_task_cancelled(

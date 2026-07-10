@@ -1125,6 +1125,8 @@
     "wechatQrcodeExpired": "QR code expired, please get a new one",
     "shareSessionInGroup": "Compartilhar Contexto em Grupo",
     "shareSessionInGroupTooltip": "Quando ativado, todos os membros do grupo compartilham o mesmo contexto de conversa. Quando desativado, cada membro tem seu próprio contexto independente.",
+    "warnContextUsage": "Avisos da Janela de Contexto",
+    "warnContextUsageTooltip": "Estima o uso de contexto após cada resposta e envia repetidamente no WeCom um aviso de redefinição ao atingir 80%.",
     "accessControlEnabled": "Controle de Acesso",
     "accessControlEnabledTooltip": "Quando ativado, apenas usuários na lista branca podem interagir com o bot. Usuários desconhecidos receberão seu ID e serão adicionados à lista de aprovação pendente.",
     "accessControlDm": "Controle de Acesso em DM",

@@ -107,6 +107,7 @@ export interface WecomConfig extends BaseChannelConfig {
   share_session_in_group?: boolean;
   max_reconnect_attempts?: number;
   streaming_enabled?: boolean;
+  warn_context_usage?: boolean;
 }
 
 export type ConsoleConfig = BaseChannelConfig;

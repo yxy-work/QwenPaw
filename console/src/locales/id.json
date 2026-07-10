@@ -500,7 +500,9 @@
     "slackBotTokenTooltip": "Slack Bot User OAuth Token, dimulai dengan xoxb-",
     "slackAppToken": "App Token",
     "slackAppTokenTooltip": "Slack App-Level Token untuk Socket Mode, dimulai dengan xapp-",
-    "slackProxyTooltip": "URL proxy HTTP untuk menghubungkan ke Slack API"
+    "slackProxyTooltip": "URL proxy HTTP untuk menghubungkan ke Slack API",
+    "warnContextUsage": "Peringatan Jendela Konteks",
+    "warnContextUsageTooltip": "Perkirakan penggunaan konteks setelah setiap balasan dan kirim berulang kali peringatan reset di WeCom setelah mencapai 80%."
   },
   "tools": {
     "title": "Tool Bawaan",

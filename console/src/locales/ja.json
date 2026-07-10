@@ -918,6 +918,8 @@
     "wechatQrcodeExpired": "QRコードが期限切れです。再取得してください",
     "shareSessionInGroup": "グループでコンテキスト共有",
     "shareSessionInGroupTooltip": "有効にすると、グループの全メンバーが同じ会話コンテキストを共有します。無効にすると、各メンバーが独立したコンテキストを持ちます。",
+    "warnContextUsage": "コンテキストウィンドウ警告",
+    "warnContextUsageTooltip": "各返信後にコンテキスト使用量を推定し、80% 以上になると WeCom でリセット警告を毎回送信します。",
     "accessControlEnabled": "アクセス制御",
     "accessControlEnabledTooltip": "有効にすると、ホワイトリストのユーザーのみBotと対話できます。未知のユーザーにはIDが通知され、承認待ちリストに追加されます。",
     "accessControlDm": "DM アクセス制御",

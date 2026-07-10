@@ -79,11 +79,11 @@ def _warn_first_run(db_path: Path) -> None:
     this workspace — the file's presence suppresses it on every later run.
     """
     logger.warning(
-        "scroll is now the DEFAULT context strategy. A durable history "
+        "scroll context strategy is explicitly enabled. A durable history "
         "store is being created at %s (this workspace had none). Conversation "
         "turns evicted from the live window are persisted there and recalled "
-        "on demand instead of being summarized in place. To restore the "
-        "previous behavior, set running.light_context_config.strategy to "
+        "on demand instead of being summarized in place. To disable context "
+        "compaction, set running.light_context_config.strategy to "
         '"native" in this agent\'s config (agent.json) and restart.',
         db_path,
     )
@@ -168,12 +168,9 @@ def build_scroll_components(
 
         sc = lcc.scroll_config
         db_path = Path(workspace_dir) / sc.db_filename
-        # First-run notice: scroll is the default as of this release, so agents
-        # that never set ``strategy`` are switched to it silently. The first
-        # time we wire scroll in a workspace we create ``history.db`` there;
-        # warn once (the file's absence is the first-run signal — it never
-        # repeats) so the switch, the new on-disk file, and the rollback path
-        # are all discoverable.
+        # The first time explicitly enabled scroll wires in a workspace, it
+        # creates ``history.db``. Warn once (the file's absence is the signal)
+        # so the new on-disk state and the disable path are visible.
         if not db_path.exists():
             _warn_first_run(db_path)
         else:

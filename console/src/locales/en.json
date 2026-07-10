@@ -1241,6 +1241,8 @@
     "wechatQrcodeExpired": "QR code expired, please get a new one",
     "shareSessionInGroup": "Share Context in Group",
     "shareSessionInGroupTooltip": "When enabled, all group members share the same conversation context. When disabled, each member has their own independent context.",
+    "warnContextUsage": "Context Window Warnings",
+    "warnContextUsageTooltip": "Estimate context usage after every reply and repeatedly send a reset warning in WeCom once usage reaches 80%.",
     "accessControlEnabled": "Access Control",
     "accessControlEnabledTooltip": "When enabled, only whitelisted users can interact with this bot. Unknown users will be prompted with their ID and added to the pending approval list.",
     "accessControlDm": "DM Access Control",

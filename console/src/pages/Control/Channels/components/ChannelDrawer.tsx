@@ -1077,6 +1077,14 @@ export function ChannelDrawer({
             >
               <Switch />
             </Form.Item>
+            <Form.Item
+              name="warn_context_usage"
+              label={t("channels.warnContextUsage")}
+              valuePropName="checked"
+              tooltip={t("channels.warnContextUsageTooltip")}
+            >
+              <Switch />
+            </Form.Item>
           </>
         );
 
