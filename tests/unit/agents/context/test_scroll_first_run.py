@@ -2,11 +2,10 @@
 # pylint: disable=too-few-public-methods,protected-access
 """The scroll first-run notice.
 
-Scroll became the DEFAULT context strategy, so agents that never set
-``strategy`` are switched to it silently and get a durable ``history.db`` in
-their workspace. ``build_scroll_components`` must log a one-time notice the
-first time it wires scroll in a workspace (the db file's absence is the
-signal), and must stay silent on every later run.
+When an agent explicitly selects ``strategy="scroll"``, it gets a durable
+``history.db`` in its workspace. ``build_scroll_components`` must log a
+one-time notice the first time it wires scroll in a workspace (the db file's
+absence is the signal), and must stay silent on every later run.
 """
 
 import logging
@@ -41,7 +40,8 @@ def _notice_records(caplog) -> list[logging.LogRecord]:
     return [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING and "DEFAULT context strategy" in r.msg
+        if r.levelno == logging.WARNING
+        and "scroll context strategy is explicitly enabled" in r.msg
     ]
 
 

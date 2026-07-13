@@ -1100,6 +1100,8 @@
     "wechatQrcodeExpired": "二维码已过期，请重新获取",
     "shareSessionInGroup": "群聊共享上下文",
     "shareSessionInGroupTooltip": "启用时，群内所有成员共享同一会话上下文；禁用时，每位成员维护各自独立的会话。",
+    "warnContextUsage": "上下文窗口告警",
+    "warnContextUsageTooltip": "启用后，每轮回复结束时估算当前会话的上下文占用；达到 80% 后在企业微信中重复发送重置提醒。",
     "accessControlEnabled": "访问控制",
     "accessControlEnabledTooltip": "开启后，只有白名单用户可以与机器人互动。未知用户会收到自己的ID提示，并被添加到待审批列表。",
     "accessControlDm": "私聊访问控制",

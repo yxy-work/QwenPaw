@@ -32,9 +32,7 @@ async def snapshot_context_usage_for_state(
             get_model_max_input_length,
         )
         from ..agents.utils.context_stats import estimate_context_tokens
-        from ..agents.utils.estimate_token_counter import (
-            EstimatedTokenCounter,
-        )
+        from ..agents.utils.token_counter import get_token_counter
 
         agent_config = load_agent_config(agent_id)
         max_input_length = int(get_model_max_input_length(agent_config) or 0)
@@ -43,7 +41,7 @@ async def snapshot_context_usage_for_state(
 
         stats = await estimate_context_tokens(
             state,
-            EstimatedTokenCounter(),
+            get_token_counter(agent_config),
             max_input_length,
         )
         details = stats.pop("messages_detail", None) or []
