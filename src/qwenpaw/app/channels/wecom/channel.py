@@ -813,7 +813,7 @@ class WecomChannel(BaseChannel):
         )
 
     async def _on_enter_chat(self, frame: Any) -> None:
-        """Handle enter_chat event; send welcome reply if configured."""
+        """发送 welcome，并主动提示当前 session 的上下文估算。"""
         logger.info("wecom enter_chat event")
         if not self.welcome_text or not self._client:
             return
@@ -821,6 +821,39 @@ class WecomChannel(BaseChannel):
             frame,
             {"msgtype": "text", "text": {"content": self.welcome_text}},
         )
+        if not self.warn_context_usage:
+            return
+
+        body = frame.get("body") or {}
+        sender_id = (body.get("from") or {}).get("userid", "")
+        chatid = body.get("chatid", "") or ""
+        chat_type = body.get("chattype", "single") or "single"
+        is_group = chat_type == "group"
+        user_id = (
+            "group"
+            if (is_group and self.share_session_in_group)
+            else sender_id
+        )
+        session_id = self.resolve_session_id(
+            sender_id,
+            {
+                "wecom_chatid": chatid,
+                "wecom_chat_type": chat_type,
+            },
+        )
+        usage = await self._estimate_context_usage_for_identity(
+            session_id=session_id,
+            user_id=user_id,
+            channel=self.channel,
+        )
+        usage_text = self._build_welcome_context_usage_text(usage)
+        target_chatid = chatid or sender_id
+        if usage_text and target_chatid:
+            await self._send_background_text(
+                frame=None,
+                chatid=target_chatid,
+                text=usage_text,
+            )
 
     # ------------------------------------------------------------------
     # File download helper
@@ -2040,32 +2073,70 @@ class WecomChannel(BaseChannel):
             return _CONTEXT_USAGE_NEAR_LIMIT_TEXT
         return None
 
-    async def _estimate_context_usage_ratio(
+    @classmethod
+    def _build_welcome_context_usage_text(
+        cls,
+        usage: dict[str, Any] | None,
+    ) -> str | None:
+        """根据 session 快照生成 enter_chat 上下文估算提示。"""
+        if not usage:
+            return None
+        try:
+            estimated_tokens = int(usage.get("estimated_tokens", 0) or 0)
+            max_input_length = int(usage.get("max_input_length", 0) or 0)
+            ratio = float(usage.get("context_usage_ratio", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+
+        if estimated_tokens == 0 and max_input_length <= 0:
+            return "当前会话暂无已保存上下文（估算占用 0%）。"
+        if (
+            estimated_tokens < 0
+            or max_input_length <= 0
+            or not math.isfinite(ratio)
+        ):
+            return None
+        ratio_text = f"{ratio:.2f}".rstrip("0").rstrip(".")
+        if "." not in ratio_text:
+            ratio_text = f"{ratio_text}.0"
+        usage_text = (
+            "当前会话上下文估算："
+            f"{estimated_tokens:,} / {max_input_length:,} tokens（{ratio_text}%）。"
+        )
+        warning_text = cls._build_context_usage_warning(ratio)
+        if warning_text is None:
+            return usage_text
+        return f"{usage_text}\n\n{warning_text}"
+
+    async def _estimate_context_usage_for_identity(
         self,
-        request: "AgentRequest",
-    ) -> float | None:
-        """读取当前 WeCom session state 并估算上下文窗口占用比例。"""
+        *,
+        session_id: str,
+        user_id: str,
+        channel: str,
+    ) -> dict[str, Any] | None:
+        """按持久化 session 身份读取完整上下文用量快照。"""
         workspace = self._workspace
         session = getattr(workspace, "session", None) if workspace else None
-        session_id = getattr(request, "session_id", "") or ""
         if session is None or not session_id:
             return None
 
-        user_id = getattr(request, "user_id", "") or session_id
-        channel = getattr(request, "channel", "") or self.channel
         agent_id = getattr(workspace, "agent_id", "default") or "default"
-
         try:
             state = await session.get_session_state_dict(
                 session_id=session_id,
-                user_id=user_id,
-                channel=channel,
+                user_id=user_id or session_id,
+                channel=channel or self.channel,
                 allow_not_exist=True,
             )
             agent_raw = state.get("agent", {}) if state else {}
             state_raw = agent_raw.get("state")
             if not isinstance(state_raw, dict):
-                return None
+                return {
+                    "estimated_tokens": 0,
+                    "max_input_length": 0,
+                    "context_usage_ratio": 0.0,
+                }
 
             from agentscope.state import AgentState
 
@@ -2074,14 +2145,10 @@ class WecomChannel(BaseChannel):
             )
 
             agent_state = AgentState.model_validate(state_raw)
-            usage = await snapshot_context_usage_for_state(
+            return await snapshot_context_usage_for_state(
                 agent_state,
                 agent_id,
             )
-            if not usage:
-                return None
-            ratio = float(usage.get("context_usage_ratio", 0) or 0)
-            return ratio if math.isfinite(ratio) else None
         except Exception:
             logger.warning(
                 "wecom 上下文窗口估算失败：session_id=%s",
@@ -2089,6 +2156,30 @@ class WecomChannel(BaseChannel):
                 exc_info=True,
             )
             return None
+
+    async def _estimate_context_usage_ratio(
+        self,
+        request: "AgentRequest",
+    ) -> float | None:
+        """读取当前 WeCom session state 并估算上下文窗口占用比例。"""
+        session_id = getattr(request, "session_id", "") or ""
+        if not session_id:
+            return None
+
+        user_id = getattr(request, "user_id", "") or session_id
+        channel = getattr(request, "channel", "") or self.channel
+        usage = await self._estimate_context_usage_for_identity(
+            session_id=session_id,
+            user_id=user_id,
+            channel=channel,
+        )
+        if usage:
+            try:
+                ratio = float(usage.get("context_usage_ratio", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+            return ratio if math.isfinite(ratio) else None
+        return None
 
     async def _warn_context_usage_if_needed(
         self,
