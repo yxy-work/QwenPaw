@@ -182,6 +182,18 @@ class AgentBuilder:
         # strategy, which needs the model for token counting, can wire in).
         model, _formatter = self.build_model(agent_config)
 
+        from ..agents.search_safety import (
+            ContextWindowBudgetGuard,
+            SearchSafetyStateStore,
+        )
+
+        search_safety_state_store = SearchSafetyStateStore()
+        context_window_budget_guard = ContextWindowBudgetGuard(
+            agent_config.running.search_knowledgebase_safety,
+            agent_config=agent_config,
+            model=model,
+        )
+
         # Built once and shared: the agent's native offloader, and (when
         # ``offload_dialog`` is on) scroll's optional dialog archive.
         offloader = self._build_offloader(ctx, agent_config)
@@ -235,7 +247,14 @@ class AgentBuilder:
         # System prompt.
         sys_prompt = self.build_prompt(ctx, agent_config)
 
-        middlewares = self._build_middlewares(ctx, agent_config)
+        middlewares = self._build_middlewares(
+            ctx,
+            agent_config,
+            toolkit=toolkit,
+            model=model,
+            search_safety_state_store=search_safety_state_store,
+            context_window_budget_guard=context_window_budget_guard,
+        )
         if scroll is not None:
             middlewares.append(scroll.cap_middleware)
 
@@ -259,6 +278,7 @@ class AgentBuilder:
             ),
             effective_skills=effective_skills,
             governor=governor,
+            search_safety_state_store=search_safety_state_store,
         )
 
         # Load session state if SessionLoadHook populated it.
@@ -673,17 +693,94 @@ class AgentBuilder:
         )
 
     @staticmethod
+    def _select_knowledgebase_search_capabilities(toolkit: Any) -> list[Any]:
+        """选择真实 KnowledgeBase Driver 暴露的原始检索 capability。"""
+        selected: list[Any] = []
+        for group in getattr(toolkit, "tool_groups", ()):
+            for tool in getattr(group, "tools", ()):
+                if (
+                    getattr(tool, "protocol", "").casefold() == "mcp"
+                    and getattr(tool, "driver_name", "")
+                    == "knowledgebase_remote"
+                    and getattr(tool, "original_capability_name", "")
+                    == "search_knowledgebase"
+                ):
+                    selected.append(tool)
+        return selected
+
+    @staticmethod
+    async def _count_current_formatted_input_tokens(
+        agent: Any,
+        budget_guard: Any,
+    ) -> int:
+        """按当前 system/context/tools 的实际模型计数路径返回输入 token。"""
+        prepared = await agent._prepare_model_input()  # pylint: disable=protected-access
+        assessment = await budget_guard.assess_model_request(
+            input_kwargs={
+                "current_model": agent.model,
+                "messages": prepared["messages"],
+                "tools": prepared["tools"],
+                "tool_choice": None,
+            },
+        )
+        if assessment.estimator == "unavailable":
+            raise RuntimeError("当前模型输入 token 无法可靠估算")
+        return assessment.current_input_tokens
+
+    @staticmethod
     def _build_middlewares(
         ctx: Any,
         agent_config: Any,
+        *,
+        toolkit: Any | None = None,
+        model: Any | None = None,
+        search_safety_state_store: Any | None = None,
+        context_window_budget_guard: Any | None = None,
     ) -> list[Any]:
         """Build middleware list.
 
         Order (onion model, outermost first):
-        1. ToolCoordinatorMiddleware — tool call lifecycle management
-        2. ToolResultPruningMiddleware — tiered tool result pruning
+        1. KnowledgeBaseSearchSafetyMiddleware — 目标检索安全短路
+        2. ToolCoordinatorMiddleware — tool call lifecycle management
+        3. ToolResultPruningMiddleware — tiered tool result pruning
+        4. ContextWindowPreflightMiddleware — provider 前最终预检
         """
         mws: list[Any] = []
+
+        safety_config = agent_config.running.search_knowledgebase_safety
+        target_capabilities = (
+            AgentBuilder._select_knowledgebase_search_capabilities(toolkit)
+            if toolkit is not None
+            else []
+        )
+        if safety_config.enabled and target_capabilities:
+            from ..agents.search_safety import (
+                KnowledgeBaseSearchSafetyMiddleware,
+            )
+
+            if search_safety_state_store is None:
+                raise ValueError("检索安全 middleware 缺少共享 StateStore")
+            if context_window_budget_guard is None:
+                raise ValueError("检索安全 middleware 缺少共享预算 Guard")
+            projected_result_tokens = (
+                context_window_budget_guard
+                .estimate_projected_tool_result_tokens()
+            )
+            mws.append(
+                KnowledgeBaseSearchSafetyMiddleware(
+                    state_store=search_safety_state_store,
+                    config=safety_config,
+                    target_capabilities=target_capabilities,
+                    budget_guard=context_window_budget_guard,
+                    current_input_tokens_getter=lambda agent: (
+                        AgentBuilder._count_current_formatted_input_tokens(
+                            agent,
+                            context_window_budget_guard,
+                        )
+                    ),
+                    projected_search_result_tokens=projected_result_tokens,
+                ),
+            )
 
         app_services = getattr(ctx, "app_services", None)
         if app_services is not None:
@@ -753,6 +850,18 @@ class AgentBuilder:
             _logger.debug(
                 "ToolResultPruningMiddleware not created",
                 exc_info=True,
+            )
+
+        if safety_config.enabled and context_window_budget_guard is not None:
+            from ..agents.search_safety import (
+                ContextWindowPreflightMiddleware,
+            )
+
+            mws.append(
+                ContextWindowPreflightMiddleware(
+                    context_window_budget_guard,
+                    enabled=safety_config.context_preflight_enabled,
+                ),
             )
 
         return mws

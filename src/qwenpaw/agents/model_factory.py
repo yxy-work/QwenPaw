@@ -611,6 +611,54 @@ _MEDIA_BLOCK_TYPES = ("image", "audio", "video")
 _FORMATTER_SKIPPED_TYPES = frozenset({"thinking", "file"})
 
 
+def _segment_reasoning_contents(content: Any) -> list[str | None]:
+    """按 tool_result 边界提取每个 wire assistant segment 的思考内容。
+
+    AgentScope 会把同一个 reply 的多轮 ReAct block 追加到一条
+    assistant message 中，而 OpenAI-family formatter 会在每个
+    ``tool_result`` 前后拆分 wire message。这里必须使用相同边界生成
+    reasoning_content，不能把第一段 thinking 复制给所有 segment。
+    """
+    if not isinstance(content, list):
+        return [None]
+
+    segment_reasoning: list[str | None] = []
+    pending_thinking: list[str] = []
+    has_wire_content = False
+
+    def flush_segment() -> None:
+        nonlocal has_wire_content
+        if has_wire_content:
+            combined = "\n".join(pending_thinking).strip()
+            segment_reasoning.append(combined or None)
+        pending_thinking.clear()
+        has_wire_content = False
+
+    for block in content:
+        block_type = (
+            block.get("type")
+            if isinstance(block, dict)
+            else getattr(block, "type", None)
+        )
+        if block_type == "tool_result":
+            flush_segment()
+            continue
+        if block_type == "thinking":
+            thinking = (
+                block.get("thinking", "")
+                if isinstance(block, dict)
+                else getattr(block, "thinking", "")
+            )
+            if thinking:
+                pending_thinking.append(str(thinking))
+            continue
+        if block_type not in _FORMATTER_SKIPPED_TYPES:
+            has_wire_content = True
+
+    flush_segment()
+    return segment_reasoning
+
+
 # pylint: disable=too-many-branches
 def _fixup_media_list(items: list) -> None:
     """Normalize media blocks in a list in-place.
@@ -829,17 +877,10 @@ def _create_file_block_support_formatter(
                 self,
             )
 
-            reasoning_contents = {}
             extra_contents: dict[str, Any] = {}
             for msg in normalized_msgs:
                 if msg.role != "assistant":
                     continue
-                for block in msg.content or []:
-                    if _battr(block, "type") == "thinking":
-                        thinking = _battr(block, "thinking", "")
-                        if thinking:
-                            reasoning_contents[id(msg)] = thinking
-                        break
                 for block in msg.content or []:
                     btype = _battr(block, "type")
                     if btype in ("tool_use", "tool_call"):
@@ -893,56 +934,23 @@ def _create_file_block_support_formatter(
                         if ec:
                             tc["extra_content"] = ec
 
-            if reasoning_contents and not is_anthropic_formatter:
+            if not is_anthropic_formatter:
                 aligned_reasoning = []
                 for m in (
                     msg for msg in normalized_msgs if msg.role == "assistant"
                 ):
-                    types = (
-                        [_battr(b, "type") for b in m.content]
-                        if isinstance(m.content, list)
-                        else []
-                    )
-                    # Drop prediction: a Msg whose blocks are *entirely*
-                    # in the skip set vanishes from formatter output
-                    # (currently {thinking, file}).  See
-                    # ``_FORMATTER_SKIPPED_TYPES``.
-                    is_dropped_by_formatter = bool(types) and all(
-                        t in _FORMATTER_SKIPPED_TYPES for t in types
-                    )
-                    if is_dropped_by_formatter:
-                        continue
-                    # Split prediction: DashScope / OpenAI-family
-                    # formatters produce one assistant wire msg per
-                    # "segment" — where tool_result blocks act as
-                    # separators (they become role="tool" messages).
-                    # Each contiguous run of text/tool_call between
-                    # tool_results becomes one assistant message.
-                    non_thinking = [t for t in types if t != "thinking"]
-                    segments = 0
-                    in_segment = False
-                    for bt in non_thinking:
-                        if bt == "tool_result":
-                            in_segment = False
-                        else:
-                            if not in_segment:
-                                segments += 1
-                                in_segment = True
-                    # Within a segment, text+tool_call still counts as
-                    # one wire msg (content + tool_calls merged).  But
-                    # if a segment has text ONLY or tool_call ONLY,
-                    # that's also 1.  The only extra split is text that
-                    # follows tool_calls (rare in model output).
-                    wire_count = max(segments, 1)
                     aligned_reasoning.extend(
-                        [reasoning_contents.get(id(m))] * wire_count,
+                        _segment_reasoning_contents(m.content),
                     )
 
                 out_assistant = [
                     m for m in messages if m.get("role") == "assistant"
                 ]
 
-                if len(aligned_reasoning) != len(out_assistant):
+                has_reasoning = any(aligned_reasoning)
+                if has_reasoning and len(aligned_reasoning) != len(
+                    out_assistant,
+                ):
                     logger.warning(
                         "Assistant message count mismatch after formatting "
                         "(%d expected survivors, %d actual). "
@@ -968,7 +976,7 @@ def _create_file_block_support_formatter(
                             _i,
                             types,
                         )
-                else:
+                elif has_reasoning:
                     for i, out_msg in enumerate(out_assistant):
                         if aligned_reasoning[i]:
                             out_msg["reasoning_content"] = aligned_reasoning[i]

@@ -548,10 +548,10 @@ class ToolResultPruningMiddleware(MiddlewareBase):
 
     def _prune_output(
         self,
-        output: str | list[dict],
+        output: str | list[dict | TextBlock],
         max_bytes: int,
         encoding: str = "utf-8",
-    ) -> str | list[dict]:
+    ) -> str | list[dict | TextBlock]:
         if isinstance(output, str):
             return self._truncate_tool_result(output, max_bytes, encoding)
         if isinstance(output, list):
@@ -559,6 +559,12 @@ class ToolResultPruningMiddleware(MiddlewareBase):
                 if isinstance(block, dict) and block.get("type") == "text":
                     block["text"] = self._truncate_tool_result(
                         block.get("text", ""),
+                        max_bytes,
+                        encoding,
+                    )
+                elif isinstance(block, TextBlock):
+                    block.text = self._truncate_tool_result(
+                        block.text,
                         max_bytes,
                         encoding,
                     )

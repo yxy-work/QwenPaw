@@ -8,10 +8,13 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator
 
+from agentscope.message import ToolCallBlock
 from agentscope.model import OpenAIChatModel
 from agentscope.model._model_response import ChatResponse
 
 from qwenpaw.local_models.tag_parser import (
+    TOOL_CALL_END,
+    TOOL_CALL_START,
     parse_tool_calls_from_text,
     text_contains_tool_call_tag,
 )
@@ -30,6 +33,86 @@ def _bset(block: Any, key: str, value: Any) -> None:
         block[key] = value
     else:
         setattr(block, key, value)
+
+
+class _TaggedToolStreamFilter:
+    """跨 streaming delta 隐藏文本形式的工具调用标签。"""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._inside_tool_call = False
+
+    @staticmethod
+    def _partial_prefix_length(text: str, marker: str) -> int:
+        """返回 text 尾部与 marker 前缀匹配的最长长度。"""
+        maximum = min(len(text), len(marker) - 1)
+        for length in range(maximum, 0, -1):
+            if marker.startswith(text[-length:]):
+                return length
+        return 0
+
+    def feed(self, delta: str) -> str:
+        """接收一个 delta，仅返回工具标签之外可安全展示的文本。"""
+        self._buffer += delta
+        visible_parts: list[str] = []
+
+        while self._buffer:
+            if self._inside_tool_call:
+                end_index = self._buffer.find(TOOL_CALL_END)
+                if end_index < 0:
+                    keep_length = min(
+                        len(self._buffer),
+                        len(TOOL_CALL_END) - 1,
+                    )
+                    self._buffer = self._buffer[-keep_length:]
+                    break
+                self._buffer = self._buffer[
+                    end_index + len(TOOL_CALL_END) :
+                ]
+                self._inside_tool_call = False
+                continue
+
+            start_index = self._buffer.find(TOOL_CALL_START)
+            if start_index >= 0:
+                visible_parts.append(self._buffer[:start_index])
+                self._buffer = self._buffer[
+                    start_index + len(TOOL_CALL_START) :
+                ]
+                self._inside_tool_call = True
+                continue
+
+            keep_length = self._partial_prefix_length(
+                self._buffer,
+                TOOL_CALL_START,
+            )
+            if keep_length:
+                visible_parts.append(self._buffer[:-keep_length])
+                self._buffer = self._buffer[-keep_length:]
+            else:
+                visible_parts.append(self._buffer)
+                self._buffer = ""
+            break
+
+        return "".join(visible_parts)
+
+
+def _clean_tagged_text(text: str) -> tuple[str, list[ToolCallBlock]]:
+    """将完整文本中的标签工具调用转换为 AgentScope 2.x block。"""
+    parsed = parse_tool_calls_from_text(text)
+    clean_text = "\n".join(
+        part
+        for part in (parsed.text_before.strip(), parsed.text_after.strip())
+        if part
+    )
+    tool_calls = [
+        ToolCallBlock(
+            id=tool_call.id,
+            name=tool_call.name,
+            input=tool_call.raw_arguments,
+        )
+        for tool_call in parsed.tool_calls
+    ]
+    return clean_text, tool_calls
 
 
 def _clone_with_overrides(obj: Any, **overrides: Any) -> Any:
@@ -510,9 +593,8 @@ class OpenAIChatModelCompat(OpenAIChatModel):
         response: Any,
     ) -> AsyncGenerator[ChatResponse, None]:
         sanitized_response = _SanitizedStream(response)
-
-        _think_tool_calls: dict[str, dict] = {}
-        _text_tool_calls: dict[str, dict] = {}
+        text_stream_filter = _TaggedToolStreamFilter()
+        thinking_stream_filter = _TaggedToolStreamFilter()
 
         async for parsed in super()._parse_stream_response(
             start_datetime=start_datetime,
@@ -582,74 +664,56 @@ class OpenAIChatModelCompat(OpenAIChatModel):
                 for b in parsed.content
             )
 
-            if has_tool_use:
-                _think_tool_calls.clear()
-                _text_tool_calls.clear()
-            else:
-                # --- 1. Scan thinking blocks ---
+            if not parsed.is_last:
+                filtered_content: list[Any] = []
                 for block in parsed.content:
-                    btype = _battr(block, "type")
-                    if btype != "thinking":
+                    block_type = _battr(block, "type")
+                    if block_type == "text":
+                        visible_text = text_stream_filter.feed(
+                            _battr(block, "text") or "",
+                        )
+                        if visible_text:
+                            _bset(block, "text", visible_text)
+                            filtered_content.append(block)
                         continue
-                    thinking_text = _battr(block, "thinking") or ""
-                    if not text_contains_tool_call_tag(thinking_text):
+                    if block_type == "thinking":
+                        visible_thinking = thinking_stream_filter.feed(
+                            _battr(block, "thinking") or "",
+                        )
+                        if visible_thinking:
+                            _bset(block, "thinking", visible_thinking)
+                            filtered_content.append(block)
                         continue
+                    filtered_content.append(block)
+                parsed.content = filtered_content
+                yield parsed
+                continue
 
-                    think_parsed = parse_tool_calls_from_text(thinking_text)
-                    if not think_parsed.tool_calls:
+            if not has_tool_use:
+                final_content: list[Any] = []
+                tagged_tool_calls: list[ToolCallBlock] = []
+                for block in parsed.content:
+                    block_type = _battr(block, "type")
+                    field_name = (
+                        "thinking"
+                        if block_type == "thinking"
+                        else "text"
+                        if block_type == "text"
+                        else None
+                    )
+                    if field_name is None:
+                        final_content.append(block)
                         continue
-
-                    _bset(block, "thinking", think_parsed.text_before.strip())
-
-                    _think_tool_calls = {
-                        f"thinking_{i}": {
-                            "type": "tool_use",
-                            "id": f"think_call_{i}",
-                            "name": ptc.name,
-                            "input": ptc.arguments,
-                            "raw_input": ptc.raw_arguments,
-                        }
-                        for i, ptc in enumerate(think_parsed.tool_calls)
-                    }
-
-                # --- 2. Scan text/content blocks ---
-                new_content: list | None = None
-                for i, block in enumerate(parsed.content):
-                    if _battr(block, "type") != "text":
+                    raw_text = _battr(block, field_name) or ""
+                    if not text_contains_tool_call_tag(raw_text):
+                        final_content.append(block)
                         continue
-                    text = _battr(block, "text") or ""
-                    if not text_contains_tool_call_tag(text):
-                        continue
+                    clean_text, converted_calls = _clean_tagged_text(raw_text)
+                    tagged_tool_calls.extend(converted_calls)
+                    if clean_text:
+                        _bset(block, field_name, clean_text)
+                        final_content.append(block)
 
-                    text_parsed = parse_tool_calls_from_text(text)
-                    clean_text = text_parsed.text_before.strip()
-                    _bset(block, "text", clean_text)
-
-                    if text_parsed.tool_calls:
-                        _text_tool_calls = {
-                            f"text_{j}": {
-                                "type": "tool_use",
-                                "id": f"text_call_{j}",
-                                "name": ptc.name,
-                                "input": ptc.arguments,
-                                "raw_input": ptc.raw_arguments,
-                            }
-                            for j, ptc in enumerate(text_parsed.tool_calls)
-                        }
-
-                    # If the text block is now empty, mark it for removal.
-                    if not clean_text:
-                        if new_content is None:
-                            new_content = list(parsed.content)
-                        new_content[i] = None  # type: ignore[index]
-
-                if new_content is not None:
-                    parsed.content = [b for b in new_content if b is not None]
-
-                extra = list(_think_tool_calls.values()) + list(
-                    _text_tool_calls.values(),
-                )
-                if extra:
-                    parsed.content = list(parsed.content) + extra
+                parsed.content = final_content + tagged_tool_calls
 
             yield parsed

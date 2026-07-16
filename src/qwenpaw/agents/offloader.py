@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import aiofiles
 import aiofiles.os
+from agentscope.message import TextBlock
 
 if TYPE_CHECKING:
     from agentscope.message import Msg, ToolResultBlock
@@ -125,6 +126,8 @@ class QwenPawOffloader:
             for block in output:
                 if isinstance(block, dict) and block.get("type") == "text":
                     parts.append(block.get("text", ""))
+                elif isinstance(block, TextBlock):
+                    parts.append(block.text)
             content = "\n".join(parts)
         else:
             content = str(output)

@@ -976,6 +976,26 @@ class AutoTitleConfig(BaseModel):
     )
 
 
+class SearchKnowledgeBaseSafetyConfig(BaseModel):
+    """``search_knowledgebase`` 单轮安全控制配置。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    max_attempts_per_reply: int = Field(default=10, ge=1, le=50)
+    exact_dedup_enabled: bool = True
+    similar_query_guard_enabled: bool = True
+    similar_query_observe_only: bool = True
+    containment_length_ratio: float = Field(default=0.80, ge=0.0, le=1.0)
+    bigram_jaccard_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    sequence_matcher_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
+    context_preflight_enabled: bool = True
+    default_reserved_completion_tokens: int = Field(default=8192, ge=0)
+    safety_margin_ratio: float = Field(default=0.03, ge=0.0, le=1.0)
+    minimum_safety_margin_tokens: int = Field(default=4096, ge=0)
+    tool_message_overhead_tokens: int = Field(default=512, ge=0)
+
+
 class AgentsRunningConfig(BaseModel):
     """Agent runtime behavior configuration."""
 
@@ -987,6 +1007,10 @@ class AgentsRunningConfig(BaseModel):
         description=(
             "Maximum number of reasoning-acting iterations for ReAct agent"
         ),
+    )
+
+    search_knowledgebase_safety: SearchKnowledgeBaseSafetyConfig = Field(
+        default_factory=SearchKnowledgeBaseSafetyConfig,
     )
 
     auto_continue_on_text_only: bool = Field(
