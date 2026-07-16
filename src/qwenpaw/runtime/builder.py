@@ -18,6 +18,8 @@ from ..agents.acp.meta import ACP_CODING_PROJECT_META_KEY
 
 _logger = logging.getLogger(__name__)
 
+_KNOWLEDGEBASE_DRIVER_PREFIX = "knowledgebase_"
+
 
 class AgentBuilder:
     """Compose an agent for each request.
@@ -694,14 +696,15 @@ class AgentBuilder:
 
     @staticmethod
     def _select_knowledgebase_search_capabilities(toolkit: Any) -> list[Any]:
-        """选择真实 KnowledgeBase Driver 暴露的原始检索 capability。"""
+        """选择 KnowledgeBase Driver family 暴露的原始检索 capability。"""
         selected: list[Any] = []
         for group in getattr(toolkit, "tool_groups", ()):
             for tool in getattr(group, "tools", ()):
+                driver_name = getattr(tool, "driver_name", "")
                 if (
                     getattr(tool, "protocol", "").casefold() == "mcp"
-                    and getattr(tool, "driver_name", "")
-                    == "knowledgebase_remote"
+                    and isinstance(driver_name, str)
+                    and driver_name.startswith(_KNOWLEDGEBASE_DRIVER_PREFIX)
                     and getattr(tool, "original_capability_name", "")
                     == "search_knowledgebase"
                 ):

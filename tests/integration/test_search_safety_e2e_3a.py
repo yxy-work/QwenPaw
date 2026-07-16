@@ -12,6 +12,7 @@ from agentscope.message import Msg, TextBlock, ToolCallBlock, UserMsg
 from agentscope.model import ChatModelBase, ChatResponse
 from agentscope.tool import ToolChoice, Toolkit
 from pydantic import BaseModel
+import pytest
 
 from qwenpaw.agents.react_agent import QwenPawAgent
 from qwenpaw.agents.search_safety.contracts import SearchSafetyDecision
@@ -138,17 +139,20 @@ def _config() -> AgentProfileConfig:
     )
 
 
-def _target_tool(fake_mcp: FakeKnowledgeBaseMCP) -> DriverCapabilityTool:
+def _target_tool(
+    fake_mcp: FakeKnowledgeBaseMCP,
+    driver_name: str = "knowledgebase_remote",
+) -> DriverCapabilityTool:
     '''创建真实 DriverCapabilityTool 身份边界。'''
     capability = DriverCapability(
         capability_id=format_capability_id(
             "mcp",
-            "knowledgebase_remote",
+            driver_name,
             "tool",
             "invoke",
             "search_knowledgebase",
         ),
-        driver_name="knowledgebase_remote",
+        driver_name=driver_name,
         protocol="mcp",
         kind="tool",
         action="invoke",
@@ -187,10 +191,11 @@ def _call(index: int, query: str, **overrides: Any) -> ToolCallBlock:
 def _build_agent(
     model: ScriptedModel,
     fake_mcp: FakeKnowledgeBaseMCP,
+    driver_name: str = "knowledgebase_remote",
 ) -> tuple[QwenPawAgent, SearchSafetyStateStore]:
     '''使用阶段 3A builder 装配真实 QwenPawAgent middleware 链。'''
     config = _config()
-    toolkit = Toolkit(tools=[_target_tool(fake_mcp)])
+    toolkit = Toolkit(tools=[_target_tool(fake_mcp, driver_name)])
     store = SearchSafetyStateStore()
     guard = ContextWindowBudgetGuard(
         config.running.search_knowledgebase_safety,
@@ -230,7 +235,13 @@ async def _run_reply(agent: QwenPawAgent, text: str) -> list[Any]:
     ]
 
 
-async def test_full_batch_workflow_force_finalizes_without_eleventh_mcp() -> None:
+@pytest.mark.parametrize(
+    "driver_name",
+    ["knowledgebase_remote", "knowledgebase_persistent"],
+)
+async def test_full_batch_workflow_force_finalizes_without_eleventh_mcp(
+    driver_name: str,
+) -> None:
     queries = [
         "如何配置知识库远程检索服务",
         "如何配置知识库远程检索服务",
@@ -260,7 +271,7 @@ async def test_full_batch_workflow_force_finalizes_without_eleventh_mcp() -> Non
         ],
     )
     fake_mcp = FakeKnowledgeBaseMCP()
-    agent, store = _build_agent(model, fake_mcp)
+    agent, store = _build_agent(model, fake_mcp, driver_name)
 
     events = await _run_reply(agent, "请全面回答")
     reply_id = agent.state.reply_id

@@ -106,20 +106,38 @@ def _agent_config() -> AgentProfileConfig:
     )
 
 
-async def test_builder_selects_only_stable_knowledgebase_identity() -> None:
-    target = _driver_tool(display_name="NOT_A_SUFFIX")
+async def test_builder_selects_stable_knowledgebase_driver_family() -> None:
+    remote = _driver_tool(display_name="NOT_A_SUFFIX")
+    persistent = _driver_tool(driver_name="knowledgebase_persistent")
+    future_backend = _driver_tool(driver_name="knowledgebase_archive")
     other_driver = _driver_tool(driver_name="other_driver")
+    no_separator = _driver_tool(driver_name="knowledgebase")
+    similar_prefix = _driver_tool(driver_name="knowledgebaseevil")
+    non_mcp = _driver_tool(
+        driver_name="knowledgebase_local",
+        protocol="http",
+    )
     similar_suffix = _driver_tool(
         capability_name="prefix_search_knowledgebase",
     )
     ordinary_mcp = _driver_tool(capability_name="ordinary_search")
     toolkit = Toolkit(
-        tools=[target, other_driver, similar_suffix, ordinary_mcp],
+        tools=[
+            remote,
+            persistent,
+            future_backend,
+            other_driver,
+            no_separator,
+            similar_prefix,
+            non_mcp,
+            similar_suffix,
+            ordinary_mcp,
+        ],
     )
 
     selected = AgentBuilder._select_knowledgebase_search_capabilities(toolkit)
 
-    assert selected == [target]
+    assert selected == [remote, persistent, future_backend]
     assert selected[0].protocol == "mcp"
     assert selected[0].driver_name == "knowledgebase_remote"
     assert selected[0].original_capability_name == "search_knowledgebase"
