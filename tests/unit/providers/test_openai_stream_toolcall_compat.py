@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agentscope.credential import OpenAICredential
+from agentscope.message import AssistantMsg, TextBlock, ToolCallBlock
 
 from qwenpaw.providers.openai_chat_model_compat import (
     OpenAIChatModelCompat,
@@ -62,8 +63,18 @@ def _make_chunk(tool_calls: list[Any]) -> Any:
     return SimpleNamespace(usage=None, choices=[choice])
 
 
-async def test_stream_parser_skips_tool_call_without_function() -> None:
-    model = CompatHarnessOpenAIChatModel(
+def _make_text_chunk(content: str) -> Any:
+    delta = SimpleNamespace(
+        reasoning_content=None,
+        content=content,
+        tool_calls=None,
+    )
+    choice = SimpleNamespace(delta=delta)
+    return SimpleNamespace(usage=None, choices=[choice])
+
+
+def _make_model() -> CompatHarnessOpenAIChatModel:
+    return CompatHarnessOpenAIChatModel(
         credential=OpenAICredential(
             api_key="sk-test",
             base_url="https://api.openai.com/v1",
@@ -71,6 +82,10 @@ async def test_stream_parser_skips_tool_call_without_function() -> None:
         model="dummy",
         stream=True,
     )
+
+
+async def test_stream_parser_skips_tool_call_without_function() -> None:
+    model = _make_model()
 
     malformed_tool_call = SimpleNamespace(
         index=0,
@@ -115,6 +130,112 @@ async def test_stream_parser_skips_tool_call_without_function() -> None:
     if isinstance(block_input, str):
         block_input = json.loads(block_input)
     assert block_input == {"x": 1}
+
+
+async def test_text_tag_tool_calls_use_agentscope_block_contract() -> None:
+    model = _make_model()
+    tagged_call = (
+        '<tool_call><function=search><parameter=kb_name>示例库</parameter>'
+        '<parameter=query>履约保证金</parameter></function></tool_call>'
+    )
+
+    responses = await model.parse_stream_for_test(
+        datetime.now(),
+        FakeAsyncStream([_make_text_chunk(tagged_call)]),
+    )
+
+    final_response = responses[-1]
+    assert final_response.is_last is True
+    assert len(final_response.content) == 1
+    tool_call = final_response.content[0]
+    assert isinstance(tool_call, ToolCallBlock)
+    assert tool_call.type == "tool_call"
+    assert isinstance(tool_call.input, str)
+    assert json.loads(tool_call.input) == {
+        "kb_name": "示例库",
+        "query": "履约保证金",
+    }
+    assistant_msg = AssistantMsg(name="assistant", content=[tool_call])
+    assert isinstance(assistant_msg.content[0], ToolCallBlock)
+
+
+async def test_split_text_tag_never_streams_raw_tool_markup() -> None:
+    model = _make_model()
+    stream = FakeAsyncStream(
+        [
+            _make_text_chunk("检索中。<tool_call>"),
+            _make_text_chunk(
+                "<function=search><parameter=query>废标条款</parameter>",
+            ),
+            _make_text_chunk("</function></tool_call>"),
+        ],
+    )
+
+    responses = await model.parse_stream_for_test(datetime.now(), stream)
+
+    streamed_text = "".join(
+        block.text
+        for response in responses[:-1]
+        for block in response.content
+        if isinstance(block, TextBlock)
+    )
+    assert streamed_text == "检索中。"
+    assert "<tool_call>" not in streamed_text
+    assert "<function=" not in streamed_text
+    assert "<parameter=" not in streamed_text
+    final_tool_calls = [
+        block
+        for block in responses[-1].content
+        if isinstance(block, ToolCallBlock)
+    ]
+    assert len(final_tool_calls) == 1
+    assert json.loads(final_tool_calls[0].input) == {"query": "废标条款"}
+
+
+async def test_split_tag_markers_and_five_calls_remain_valid() -> None:
+    model = _make_model()
+    chunks = [_make_text_chunk("<tool_")]
+    for index in range(5):
+        prefix = "call>" if index == 0 else "<tool_call>"
+        chunks.append(
+            _make_text_chunk(
+                f"{prefix}<function=search>"
+                f"<parameter=query>检索-{index}</parameter></function>"
+                "</tool_",
+            ),
+        )
+        chunks.append(_make_text_chunk("call>"))
+
+    responses = await model.parse_stream_for_test(
+        datetime.now(),
+        FakeAsyncStream(chunks),
+    )
+
+    streamed_text = "".join(
+        block.text
+        for response in responses[:-1]
+        for block in response.content
+        if isinstance(block, TextBlock)
+    )
+    assert streamed_text == ""
+    final_tool_calls = [
+        block
+        for block in responses[-1].content
+        if isinstance(block, ToolCallBlock)
+    ]
+    assert len(final_tool_calls) == 5
+    assert len({block.id for block in final_tool_calls}) == 5
+    assert [json.loads(block.input)["query"] for block in final_tool_calls] == [
+        f"检索-{index}" for index in range(5)
+    ]
+    assistant_msg = AssistantMsg(
+        name="assistant",
+        content=final_tool_calls,
+    )
+    assert all(
+        isinstance(block, ToolCallBlock)
+        for block in assistant_msg.content
+    )
 
 
 def test_sanitize_tool_call_normalizes_non_string_arguments() -> None:

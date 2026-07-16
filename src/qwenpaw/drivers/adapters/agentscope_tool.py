@@ -26,6 +26,7 @@ from ..capabilities import (
     DriverCapability,
     DriverInvocation,
     DriverInvocationResult,
+    parse_capability_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,12 +152,43 @@ class DriverCapabilityTool(ToolBase):
         invoker: DriverInvoker,
         request_context: dict[str, str] | None = None,
     ) -> None:
+        (
+            identity_protocol,
+            identity_driver_name,
+            _,
+            _,
+            identity_capability_name,
+        ) = parse_capability_id(capability.capability_id)
         self.name = capability.exposure.tool_name or capability.name
         self.description = capability.description
         self.input_schema = dict(capability.input_schema or {})
+        self._identity_capability_id = capability.capability_id
+        self._identity_driver_name = identity_driver_name
+        self._identity_protocol = identity_protocol
+        self._identity_capability_name = identity_capability_name
         self._capability = capability
         self._invoker = invoker
         self._request_context = dict(request_context or {})
+
+    @property
+    def capability_id(self) -> str:
+        """返回 Driver capability 的稳定标识。"""
+        return self._identity_capability_id
+
+    @property
+    def driver_name(self) -> str:
+        """返回 capability id 中编码的稳定 Driver key。"""
+        return self._identity_driver_name
+
+    @property
+    def protocol(self) -> str:
+        """返回 capability id 中编码的 Driver protocol。"""
+        return self._identity_protocol
+
+    @property
+    def original_capability_name(self) -> str:
+        """返回 namespace 和展示名变换前的 capability 名称。"""
+        return self._identity_capability_name
 
     async def check_permissions(
         self,
